@@ -1,3 +1,9 @@
+> **Historický dokument.** Popisuje původní návrh z 1. 9. 2026. Části o
+> tombstonech, verzích, `seq`, poolu refresh workerů, `LoadAllFunc`/`LoadOneFunc`
+> a srovnání s ostatními knihovnami **neplatí** - nahradilo je
+> `_design/2026-09-01-simplification-plan.md`. Aktuální popis knihovny je
+> v `README.md`.
+
 # eventual-cache — implementační plán
 
 > **Status: hotovo.** Knihovna je naimplementovaná a leží vedle tohohle dokumentu

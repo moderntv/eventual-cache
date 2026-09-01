@@ -13,26 +13,26 @@ const (
 
 type Metrics struct {
 	ItemsCount        prometheus.Gauge
-	TombstonesCount   prometheus.Gauge
-	QueueLength       prometheus.Gauge
+	PendingCount      prometheus.Gauge
 	LastSyncTimestamp prometheus.Gauge
 	LastSyncDuration  prometheus.Gauge
 
-	ReadsCount  prometheus.Counter
-	MissesCount prometheus.Counter
+	// ReadsCount and MissesCount are fed from the per shard counters by the
+	// background goroutine, everything else is counted where the event happens.
+	ReadsCount             prometheus.Counter
+	MissesCount            prometheus.Counter
+	MissesRateLimitedCount prometheus.Counter
+	InvalidationsCount     prometheus.Counter
 
-	RefreshEnqueuedCount prometheus.Counter
-	RefreshDroppedCount  prometheus.Counter
-	RefreshBatchCount    prometheus.Counter
-	RefreshItemsCount    prometheus.Counter
-	InvalidationsCount   prometheus.Counter
-	LoadErrorsCount      prometheus.Counter
+	BatchLoadCount      prometheus.Counter
+	BatchLoadItemsCount prometheus.Counter
+	LoadErrorsCount     prometheus.Counter
+	ListIDsErrorsCount  prometheus.Counter
 
 	SyncRunsCount    prometheus.Counter
-	SyncErrorsCount  prometheus.Counter
 	SyncAddedCount   prometheus.Counter
+	SyncMarkedCount  prometheus.Counter
 	SyncRemovedCount prometheus.Counter
-	ReloadsCount     prometheus.Counter
 }
 
 func New(
@@ -47,8 +47,7 @@ func New(
 		help   string
 	}{
 		{&m.ItemsCount, "items_count", "Current number of cached items"},
-		{&m.TombstonesCount, "tombstones_count", "Current number of remembered not-found answers"},
-		{&m.QueueLength, "queue_length", "Number of IDs waiting for a refresh"},
+		{&m.PendingCount, "pending_count", "Number of IDs waiting to be loaded"},
 		{&m.LastSyncTimestamp, "last_sync_timestamp", "Unix timestamp of the last successful reconciliation"},
 		{&m.LastSyncDuration, "last_sync_duration_seconds", "Duration of the last reconciliation in seconds"},
 	}
@@ -74,19 +73,18 @@ func New(
 		name   string
 		help   string
 	}{
-		{&m.ReadsCount, "reads_count", "Total number of Get / GetMultiple lookups"},
-		{&m.MissesCount, "misses_count", "Lookups for an ID the replica does not know at all"},
-		{&m.RefreshEnqueuedCount, "refresh_enqueued_count", "Total number of items queued for a refresh"},
-		{&m.RefreshDroppedCount, "refresh_dropped_count", "Refresh requests dropped because the queue was full"},
-		{&m.RefreshBatchCount, "refresh_batch_count", "Total number of loader calls made by refresh workers"},
-		{&m.RefreshItemsCount, "refresh_items_count", "Total number of items sent to the loader by refresh workers"},
-		{&m.InvalidationsCount, "invalidations_count", "Total number of Invalidate / InvalidateMultiple requests"},
-		{&m.LoadErrorsCount, "load_errors_count", "Loads which ended with an error other than not found"},
-		{&m.SyncRunsCount, "sync_runs_count", "Total number of reconciliation runs"},
-		{&m.SyncErrorsCount, "sync_errors_count", "Reconciliation runs which failed"},
-		{&m.SyncAddedCount, "sync_added_count", "Items added by reconciliation"},
-		{&m.SyncRemovedCount, "sync_removed_count", "Items removed by reconciliation"},
-		{&m.ReloadsCount, "reloads_count", "Total number of full reloads"},
+		{&m.ReadsCount, "reads_count", "Total number of Get calls"},
+		{&m.MissesCount, "misses_count", "Get calls for an ID the replica does not have"},
+		{&m.MissesRateLimitedCount, "misses_rate_limited", "Lookups of unknown IDs not queued because of the rate limit"},
+		{&m.InvalidationsCount, "invalidations_count", "Total number of Invalidate calls"},
+		{&m.BatchLoadCount, "batch_loads", "Total number of LoadMultipleFunc calls"},
+		{&m.BatchLoadItemsCount, "batch_load_items", "Total number of IDs passed to LoadMultipleFunc"},
+		{&m.LoadErrorsCount, "error_loads", "Loads which ended with an error other than not found"},
+		{&m.ListIDsErrorsCount, "list_ids_errors", "ListIDsFunc calls which failed"},
+		{&m.SyncRunsCount, "sync_runs", "Total number of reconciliation runs"},
+		{&m.SyncAddedCount, "sync_added", "Items loaded by reconciliation because the replica did not have them"},
+		{&m.SyncMarkedCount, "sync_marked", "Items marked for deletion by reconciliation"},
+		{&m.SyncRemovedCount, "sync_removed", "Items removed by reconciliation"},
 	}
 
 	for _, c := range counters {

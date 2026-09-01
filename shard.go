@@ -17,7 +17,8 @@ type shardCore[T any] struct {
 
 	// Read counters live in the shard so that incrementing them does not create
 	// one globally contended cache line. They share the line with the mutex,
-	// which every reader dirties anyway.
+	// which every reader dirties anyway. The background goroutine sums them up
+	// into Prometheus once a second.
 	reads  atomic.Uint64
 	misses atomic.Uint64
 }
@@ -34,6 +35,15 @@ type shard[T any] struct {
 // compile time check that a shard really is a whole number of cache lines
 var _ = [1]struct{}{}[unsafe.Sizeof(shard[struct{}]{})%cacheLinePadBytes]
 
+// syncShardCounts is where a parallel shard worker leaves its counts. Padded,
+// because the workers write to neighbouring elements of one slice.
+type syncShardCounts struct {
+	marked  int
+	removed int
+
+	_ [cacheLinePadBytes - 16]byte
+}
+
 func (c *Cache[T]) shardOf(ID int64) *shard[T] {
 	return &c.shards[c.shardHash(ID, c.shardBits)]
 }
@@ -41,10 +51,7 @@ func (c *Cache[T]) shardOf(ID int64) *shard[T] {
 // forEachShardParallel runs fn for every shard using GOMAXPROCS goroutines.
 // Spawning one goroutine per shard would be wasteful - there can be thousands.
 func (c *Cache[T]) forEachShardParallel(fn func(index int, sh *shard[T])) {
-	workers := runtime.GOMAXPROCS(0)
-	if workers > len(c.shards) {
-		workers = len(c.shards)
-	}
+	workers := min(runtime.GOMAXPROCS(0), len(c.shards))
 	if workers < 1 {
 		workers = 1
 	}

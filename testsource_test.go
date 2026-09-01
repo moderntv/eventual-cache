@@ -18,44 +18,45 @@ type testItem struct {
 
 // testSource is a fake data source with call counters and hooks.
 type testSource struct {
-	mu       sync.Mutex
-	items    map[int64]testItem
-	versions map[int64]int64
+	mu    sync.Mutex
+	items map[int64]testItem
 	// omit holds IDs that listIDs pretends not to see, even though the source
 	// still has them (a stale read from a replica).
 	omit map[int64]struct{}
 
-	loadAllCalls      atomic.Int64
 	listIDsCalls      atomic.Int64
-	loadOneCalls      atomic.Int64
 	loadMultipleCalls atomic.Int64
-	loadedItems       atomic.Int64
 
-	loadAllErr atomic.Pointer[error]
 	listIDsErr atomic.Pointer[error]
 	loadErr    atomic.Pointer[error]
 
-	loadDelay    atomic.Int64 // nanoseconds
-	listIDsDelay atomic.Int64 // nanoseconds
+	loadDelay atomic.Int64 // nanoseconds
 
-	onListIDs atomic.Pointer[func()]
-	onLoad    atomic.Pointer[func(IDs []int64)]
+	onLoad atomic.Pointer[func(IDs []int64)]
 
 	requestsMu sync.Mutex
 	requests   map[int64]int
 }
 
+// testIDs returns the IDs newTestSource(n) fills the source with: step 6, the
+// shape an auto-increment column has on a multi node cluster.
+func testIDs(n int) (IDs []int64) {
+	IDs = make([]int64, n)
+	for i := range IDs {
+		IDs[i] = int64(1 + i*6)
+	}
+
+	return
+}
+
 func newTestSource(n int) *testSource {
 	s := &testSource{
 		items:    make(map[int64]testItem),
-		versions: make(map[int64]int64),
 		omit:     make(map[int64]struct{}),
 		requests: make(map[int64]int),
 	}
 
-	// IDs with step 6, like a 6 node MariaDB Galera cluster
-	for i := 0; i < n; i++ {
-		ID := int64(1 + i*6)
+	for _, ID := range testIDs(n) {
 		s.set(ID, "item")
 	}
 
@@ -67,7 +68,6 @@ func (s *testSource) set(ID int64, name string) {
 	defer s.mu.Unlock()
 
 	s.items[ID] = testItem{ID: ID, Name: name}
-	s.versions[ID]++
 }
 
 func (s *testSource) remove(ID int64) {
@@ -75,6 +75,31 @@ func (s *testSource) remove(ID int64) {
 	defer s.mu.Unlock()
 
 	delete(s.items, ID)
+}
+
+func (s *testSource) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.items)
+}
+
+func (s *testSource) omitFromList(IDs ...int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, ID := range IDs {
+		s.omit[ID] = struct{}{}
+	}
+}
+
+func (s *testSource) showInList(IDs ...int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, ID := range IDs {
+		delete(s.omit, ID)
+	}
 }
 
 // recordRequests counts how many times each ID was asked for.
@@ -94,35 +119,9 @@ func (s *testSource) requestCount(ID int64) int {
 	return s.requests[ID]
 }
 
-func (s *testSource) totalRequests() (total int) {
-	s.requestsMu.Lock()
-	defer s.requestsMu.Unlock()
-
-	for _, count := range s.requests {
-		total += count
-	}
-
-	return
-}
-
-func (s *testSource) omitFromList(IDs ...int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, ID := range IDs {
-		s.omit[ID] = struct{}{}
-	}
-}
-
-func (s *testSource) count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return len(s.items)
-}
-
 func (s *testSource) err(p *atomic.Pointer[error]) error {
-	if e := p.Load(); e != nil {
+	e := p.Load()
+	if e != nil {
 		return *e
 	}
 
@@ -139,39 +138,11 @@ func setErr(p *atomic.Pointer[error], err error) {
 	p.Store(&err)
 }
 
-func (s *testSource) loadAll(_ context.Context) (entries []LoadedEntry[testItem], err error) {
-	s.loadAllCalls.Add(1)
-
-	if err = s.err(&s.loadAllErr); err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	entries = make([]LoadedEntry[testItem], 0, len(s.items))
-	for ID, item := range s.items {
-		value := item
-		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value, Version: s.versions[ID]})
-	}
-
-	s.loadedItems.Add(int64(len(entries)))
-
-	return entries, nil
-}
-
 func (s *testSource) listIDs(_ context.Context) (IDs []int64, err error) {
 	s.listIDsCalls.Add(1)
 
-	if d := s.listIDsDelay.Load(); d > 0 {
-		time.Sleep(time.Duration(d))
-	}
-
-	if hook := s.onListIDs.Load(); hook != nil {
-		(*hook)()
-	}
-
-	if err = s.err(&s.listIDsErr); err != nil {
+	err = s.err(&s.listIDsErr)
+	if err != nil {
 		return nil, err
 	}
 
@@ -180,7 +151,8 @@ func (s *testSource) listIDs(_ context.Context) (IDs []int64, err error) {
 
 	IDs = make([]int64, 0, len(s.items))
 	for ID := range s.items {
-		if _, omitted := s.omit[ID]; omitted {
+		_, omitted := s.omit[ID]
+		if omitted {
 			continue
 		}
 
@@ -195,15 +167,18 @@ func (s *testSource) loadMultiple(_ context.Context, IDs []int64) (entries []Loa
 	s.loadMultipleCalls.Add(1)
 	s.recordRequests(IDs...)
 
-	if hook := s.onLoad.Load(); hook != nil {
+	hook := s.onLoad.Load()
+	if hook != nil {
 		(*hook)(IDs)
 	}
 
-	if d := s.loadDelay.Load(); d > 0 {
+	d := s.loadDelay.Load()
+	if d > 0 {
 		time.Sleep(time.Duration(d))
 	}
 
-	if err = s.err(&s.loadErr); err != nil {
+	err = s.err(&s.loadErr)
+	if err != nil {
 		return nil, err
 	}
 
@@ -214,71 +189,44 @@ func (s *testSource) loadMultiple(_ context.Context, IDs []int64) (entries []Loa
 	for _, ID := range IDs {
 		item, exists := s.items[ID]
 		if !exists {
-			continue // the cache turns a missing ID into a tombstone on its own
+			continue // an ID missing from the answer is removed by the cache
 		}
 
 		value := item
-		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value, Version: s.versions[ID]})
-		s.loadedItems.Add(1)
+		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value})
 	}
 
 	return entries, nil
 }
 
-func (s *testSource) loadOne(_ context.Context, ID int64) (value *testItem, version int64, err error) {
-	s.loadOneCalls.Add(1)
-	s.recordRequests(ID)
-
-	if d := s.loadDelay.Load(); d > 0 {
-		time.Sleep(time.Duration(d))
-	}
-
-	if err = s.err(&s.loadErr); err != nil {
-		return nil, 0, err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	item, exists := s.items[ID]
-	if !exists {
-		return nil, 0, ErrNotFound
-	}
-
-	s.loadedItems.Add(1)
-	copied := item
-
-	return &copied, s.versions[ID], nil
-}
-
 var testTimeouts = Timeouts{
-	SyncInterval:       time.Hour, // tests drive Sync explicitly unless stated otherwise
-	NotFoundTTL:        time.Minute,
-	ErrorRetryInterval: 0,
-	Randomizer:         0,
+	SyncInterval:    time.Hour, // tests that want a reconciliation shorten it
+	RefreshInterval: 5 * time.Millisecond,
+	Randomizer:      0,
 }
 
-func newTestCache(t *testing.T, source *testSource, modify func(p *Params[testItem])) *Cache[testItem] {
-	t.Helper()
-
+func testParams(source *testSource, modify func(p *Params[testItem])) Params[testItem] {
 	params := Params[testItem]{
-		Context:           context.Background(),
-		Log:               test_utils.Logger(),
-		Name:              "test",
-		LoadAllFunc:       source.loadAll,
-		ListIDsFunc:       source.listIDs,
-		LoadMultipleFunc:  source.loadMultiple,
-		LoadOneFunc:       source.loadOne,
-		Timeouts:          testTimeouts,
-		Shards:            16,
-		RefreshBatchDelay: 5 * time.Millisecond,
+		Context:          context.Background(),
+		Log:              test_utils.Logger(),
+		Name:             "test",
+		ListIDsFunc:      source.listIDs,
+		LoadMultipleFunc: source.loadMultiple,
+		Timeouts:         testTimeouts,
+		Shards:           16,
 	}
 
 	if modify != nil {
 		modify(&params)
 	}
 
-	c, err := New(params)
+	return params
+}
+
+func newTestCache(t *testing.T, source *testSource, modify func(p *Params[testItem])) *Cache[testItem] {
+	t.Helper()
+
+	c, err := New(testParams(source, modify))
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
 	}
@@ -300,4 +248,43 @@ func waitFor(timeout time.Duration, cond func() bool) bool {
 	}
 
 	return cond()
+}
+
+// syncWatcher counts finished reconciliations.
+type syncWatcher chan struct{}
+
+func newSyncWatcher() syncWatcher {
+	return make(syncWatcher, 256)
+}
+
+func (w syncWatcher) hook() func() {
+	return func() {
+		select {
+		case w <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// wait waits until n reconciliations have finished.
+func (w syncWatcher) wait(t *testing.T, n int) {
+	t.Helper()
+
+	for i := 0; i < n; i++ {
+		select {
+		case <-w:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d reconciliations finished", i, n)
+		}
+	}
+}
+
+// name returns the value of the item, or "" when the replica does not have it.
+func name(c *Cache[testItem], ID int64) string {
+	item := c.Get(ID)
+	if item == nil {
+		return ""
+	}
+
+	return item.Name
 }

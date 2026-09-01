@@ -1,17 +1,18 @@
 package eventual
 
-import (
-	"sync"
-	"time"
-)
+import "sync/atomic"
 
-// rateLimiter is a token bucket. A nil rateLimiter allows everything.
+// rateLimiter allows at most limit events per second. It is a coarse window
+// counter and not a token bucket: it sits on the miss path of Get, so it must not
+// take a lock and must not call time.Now - it is handed the coarse clock instead.
+//
+// A nil rateLimiter allows everything.
 type rateLimiter struct {
-	mu     sync.Mutex
-	tokens float64
-	max    float64
-	rate   float64
-	last   time.Time
+	limit int64
+
+	// window is the current second, count the events already allowed in it.
+	window atomic.Int64
+	count  atomic.Int64
 }
 
 func newRateLimiter(perSecond int) *rateLimiter {
@@ -19,33 +20,28 @@ func newRateLimiter(perSecond int) *rateLimiter {
 		return nil
 	}
 
-	return &rateLimiter{
-		tokens: float64(perSecond),
-		max:    float64(perSecond),
-		rate:   float64(perSecond),
-		last:   time.Now(),
-	}
+	return &rateLimiter{limit: int64(perSecond)}
 }
 
-func (r *rateLimiter) allow() bool {
+// allow reports whether one more event fits into the current second.
+//
+// Two callers crossing a second boundary at the same time can lose or double
+// count a few events, which is fine for a throttle: it is here to keep a flood of
+// lookups off the source, not to meter anything.
+func (r *rateLimiter) allow(nowMillis int64) bool {
 	if r == nil {
 		return true
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	window := nowMillis / 1000
 
-	now := time.Now()
-	r.tokens += now.Sub(r.last).Seconds() * r.rate
-	if r.tokens > r.max {
-		r.tokens = r.max
+	current := r.window.Load()
+	if window != current {
+		swapped := r.window.CompareAndSwap(current, window)
+		if swapped {
+			r.count.Store(0)
+		}
 	}
-	r.last = now
 
-	if r.tokens < 1 {
-		return false
-	}
-	r.tokens--
-
-	return true
+	return r.count.Add(1) <= r.limit
 }

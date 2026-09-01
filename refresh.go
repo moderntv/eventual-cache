@@ -1,364 +1,131 @@
 package eventual
 
 import (
-	"context"
-	"errors"
 	"time"
+
+	"github.com/moderntv/eventual-cache/internal/utils"
 )
 
-// enqueueRefresh queues an existing item for a refresh, or - when the replica
-// does not know the ID at all - queues it as a new item.
-func (c *Cache[T]) enqueueRefresh(ID int64) {
-	sh := c.shardOf(ID)
+const (
+	// clockInterval is how often the coarse clock read by Get and by the miss rate
+	// limiter is updated. It is the precision of the TTL, which is measured in
+	// minutes at least, so 100ms is plenty.
+	clockInterval = 100 * time.Millisecond
 
-	sh.mu.RLock()
-	e, exists := sh.data[ID]
-	sh.mu.RUnlock()
+	// metricsInterval is how often the shard read counters are collected into
+	// Prometheus.
+	metricsInterval = time.Second
+)
 
-	if !exists {
-		// an explicit invalidation of an unknown ID usually means a newly created
-		// item, so it is never rate limited
-		c.enqueueUnknown(ID, false)
-
-		return
-	}
-
-	c.enqueueEntry(ID, e)
-}
-
-// enqueueEntry queues an item the caller already has the entry of.
-func (c *Cache[T]) enqueueEntry(ID int64, e *entry[T]) {
-	if !e.refreshing.CompareAndSwap(false, true) {
-		// a refresh is already running or queued - make sure it happens once more,
-		// otherwise this invalidation would be swallowed
-		e.dirty.Store(true)
-
-		return
-	}
-
-	e.dirty.Store(false)
-
-	select {
-	case c.refreshCh <- ID:
-		if c.metrics != nil {
-			c.metrics.RefreshEnqueuedCount.Inc()
-		}
-
-	default:
-		e.refreshing.Store(false)
-		c.reportDropped(ID)
-	}
-}
-
-// enqueueUnknown queues an ID the replica does not hold. Dedup happens before
-// the rate limiter so that duplicates do not consume tokens.
-func (c *Cache[T]) enqueueUnknown(ID int64, rateLimited bool) {
-	if _, loaded := c.pending.LoadOrStore(ID, struct{}{}); loaded {
-		return
-	}
-
-	if rateLimited && !c.missLimiter.allow() {
-		c.pending.Delete(ID)
-
-		return
-	}
-
-	select {
-	case c.refreshCh <- ID:
-		if c.metrics != nil {
-			c.metrics.RefreshEnqueuedCount.Inc()
-		}
-
-	default:
-		c.pending.Delete(ID)
-		c.reportDropped(ID)
-	}
-}
-
-func (c *Cache[T]) reportDropped(ID int64) {
-	if c.metrics != nil {
-		c.metrics.RefreshDroppedCount.Inc()
-	}
-
-	c.log.Warn().
-		Int64("id", ID).
-		Int("queue_size", cap(c.refreshCh)).
-		Msg("refresh queue is full, request dropped")
-}
-
-// releaseGate clears the deduplication flags of an ID and queues it again when an
-// invalidation arrived while it was being loaded.
-func (c *Cache[T]) releaseGate(ID int64) {
-	c.pending.Delete(ID)
-
-	sh := c.shardOf(ID)
-
-	sh.mu.RLock()
-	e, exists := sh.data[ID]
-	sh.mu.RUnlock()
-
-	if !exists {
-		return
-	}
-
-	e.refreshing.Store(false)
-
-	if e.dirty.Load() {
-		c.enqueueEntry(ID, e)
-	}
-}
-
-// refresher holds the per worker buffers so that a refresh does not allocate.
-type refresher[T any] struct {
-	cache   *Cache[T]
-	batch   []int64
-	entries []LoadedEntry[T]
-	loaded  map[int64]struct{}
-	timer   *time.Timer
-}
-
-func (c *Cache[T]) startRefreshWorker() {
+// run is the only background goroutine of the cache. It reloads marked items,
+// periodically reconciles the replica with the source, keeps the coarse clock
+// moving and collects the shard counters into Prometheus.
+//
+// Reloading and reconciliation share one goroutine on purpose: a reconciliation
+// can then never interleave with a reload, which is one less race to reason
+// about and costs nothing - both are background work with no latency budget.
+func (c *Cache[T]) run() {
 	defer c.wg.Done()
 
-	r := &refresher[T]{
-		cache:   c,
-		batch:   make([]int64, 0, c.refreshBatchSize),
-		entries: make([]LoadedEntry[T], 0, c.refreshBatchSize),
-		loaded:  make(map[int64]struct{}, c.refreshBatchSize),
-		timer:   time.NewTimer(time.Hour),
-	}
+	l := c.newLoader()
+	mc := &metricsCollector{}
 
-	if !r.timer.Stop() {
-		<-r.timer.C
+	refreshTicker := time.NewTicker(c.timeouts.RefreshInterval)
+	defer refreshTicker.Stop()
+
+	syncTimer := time.NewTimer(utils.RandomizeDuration(c.timeouts.SyncInterval, c.timeouts.Randomizer))
+	defer syncTimer.Stop()
+
+	clockTicker := time.NewTicker(clockInterval)
+	defer clockTicker.Stop()
+
+	// receiving from a nil channel blocks forever, which is how the metrics ticker
+	// stays switched off when there is no registry
+	var metricsCh <-chan time.Time
+
+	if c.metrics != nil {
+		metricsTicker := time.NewTicker(metricsInterval)
+		defer metricsTicker.Stop()
+
+		metricsCh = metricsTicker.C
 	}
-	defer r.timer.Stop()
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 
-		case ID := <-c.refreshCh:
-			r.batch = append(r.batch[:0], ID)
-		}
+		case <-refreshTicker.C:
+			c.reloadMarked(l)
 
-		r.collect()
-		r.load()
+		case <-c.batchFull:
+			c.reloadMarked(l)
 
-		if c.ctx.Err() != nil {
-			return
-		}
-	}
-}
+		case <-syncTimer.C:
+			c.sync(c.ctx, l)
+			syncTimer.Reset(utils.RandomizeDuration(c.timeouts.SyncInterval, c.timeouts.Randomizer))
 
-// collect waits a short while for more IDs so that they can be loaded in one call.
-func (r *refresher[T]) collect() {
-	r.timer.Reset(r.cache.refreshBatchDelay)
+		case <-clockTicker.C:
+			c.updateClock()
 
-collecting:
-	for len(r.batch) < r.cache.refreshBatchSize {
-		select {
-		case ID := <-r.cache.refreshCh:
-			r.batch = append(r.batch, ID)
-
-		case <-r.timer.C:
-			return
-
-		case <-r.cache.ctx.Done():
-			break collecting
-		}
-	}
-
-	if !r.timer.Stop() {
-		select {
-		case <-r.timer.C:
-		default:
+		case <-metricsCh:
+			c.collectMetrics(mc)
 		}
 	}
 }
 
-func (r *refresher[T]) load() {
-	c := r.cache
-
-	if c.metrics != nil {
-		c.metrics.RefreshBatchCount.Inc()
-		c.metrics.RefreshItemsCount.Add(float64(len(r.batch)))
+// reloadMarked loads every item currently in the pending set: items marked by
+// Invalidate, items whose TTL has passed, and IDs a Get asked for and the replica
+// did not have. IDs whose load failed are marked again, so the next run tries
+// them.
+func (c *Cache[T]) reloadMarked(l *loader[T]) {
+	l.IDs = c.pending.drain(l.IDs[:0])
+	if len(l.IDs) == 0 {
+		return
 	}
 
-	err := r.callLoader()
+	// the flags are cleared before the load, so that an invalidation arriving
+	// during the load marks the item again instead of being swallowed
+	for _, ID := range l.IDs {
+		e, exists := c.entryOf(ID)
+		if !exists {
+			continue
+		}
+
+		e.invalidated.Store(false)
+	}
+
+	added, removed, err := l.loadAll(c.ctx, l.IDs)
 	if err != nil {
-		c.log.Warn().Err(err).Int("count", len(r.batch)).Msg("refresh batch failed")
+		c.log.Warn().
+			Err(err).
+			Int("count", len(l.IDs)).
+			Msg("reloading marked items failed, they stay marked")
 
-		if c.metrics != nil {
-			c.metrics.LoadErrorsCount.Inc()
+		for _, ID := range l.IDs {
+			c.remark(ID)
 		}
-
-		// the values stay as they are, only the deduplication flags are released
-		for _, ID := range r.batch {
-			c.releaseGate(ID)
-		}
-
-		r.pauseAfterError()
 
 		return
 	}
 
-	c.applyLoaded(r.entries, r.batch, r.loaded)
+	c.log.Debug().
+		Int("count", len(l.IDs)).
+		Int("added", added).
+		Int("removed", removed).
+		Msg("marked items reloaded")
 }
 
-func (r *refresher[T]) callLoader() (err error) {
-	c := r.cache
-
-	if c.loadMultipleFunc != nil {
-		r.entries, err = c.loadMultipleFunc(c.ctx, r.batch)
-
-		return
-	}
-
-	r.entries = r.entries[:0]
-	for _, ID := range r.batch {
-		value, version, loadErr := c.loadOneFunc(c.ctx, ID)
-		r.entries = append(r.entries, LoadedEntry[T]{ID: ID, Value: value, Version: version, Err: loadErr})
-	}
-
-	return nil
-}
-
-func (r *refresher[T]) pauseAfterError() {
-	if r.cache.timeouts.ErrorRetryInterval <= 0 {
-		return
-	}
-
-	r.timer.Reset(r.cache.timeouts.ErrorRetryInterval)
-
-	select {
-	case <-r.timer.C:
-	case <-r.cache.ctx.Done():
-		if !r.timer.Stop() {
-			select {
-			case <-r.timer.C:
-			default:
-			}
-		}
-	}
-}
-
-// applyLoaded stores the loaded entries and releases the deduplication flags.
-// IDs the loader did not return are stored as not found.
-func (c *Cache[T]) applyLoaded(entries []LoadedEntry[T], requested []int64, loaded map[int64]struct{}) {
-	nowMillis := time.Now().UnixMilli()
-
-	clear(loaded)
-
-	for _, le := range entries {
-		loaded[le.ID] = struct{}{}
-
-		if le.Err != nil && !errors.Is(le.Err, ErrNotFound) {
-			c.log.Warn().Err(le.Err).Int64("id", le.ID).Msg("item load failed")
-
-			if c.metrics != nil {
-				c.metrics.LoadErrorsCount.Inc()
-			}
-
-			continue
-		}
-
-		c.store(le, nowMillis)
-	}
-
-	for _, ID := range requested {
-		if _, ok := loaded[ID]; !ok {
-			c.store(LoadedEntry[T]{ID: ID, Err: ErrNotFound}, nowMillis)
-		}
-
-		c.releaseGate(ID)
-	}
-}
-
-// loadIDs loads the given IDs in batches. It is used by the reconciliation, which
-// must not push thousands of IDs through the refresh queue.
-func (c *Cache[T]) loadIDs(ctx context.Context, IDs []int64) (added int) {
-	batch := make([]int64, 0, c.refreshBatchSize)
-	loaded := make(map[int64]struct{}, c.refreshBatchSize)
-
-	flush := func() {
-		if len(batch) == 0 {
+// remark puts an ID back into the pending set after a failed load. It does not
+// go through the rate limiter - the ID has already been let through once.
+func (c *Cache[T]) remark(ID int64) {
+	e, exists := c.entryOf(ID)
+	if exists {
+		alreadyMarked := !e.invalidated.CompareAndSwap(false, true)
+		if alreadyMarked {
 			return
 		}
-
-		entries, err := c.callLoaderFor(ctx, batch)
-		if err != nil {
-			c.log.Warn().Err(err).Int("count", len(batch)).Msg("bulk load failed")
-
-			if c.metrics != nil {
-				c.metrics.LoadErrorsCount.Inc()
-			}
-
-			for _, ID := range batch {
-				c.pending.Delete(ID)
-			}
-			batch = batch[:0]
-
-			return
-		}
-
-		nowMillis := time.Now().UnixMilli()
-		clear(loaded)
-
-		for _, le := range entries {
-			loaded[le.ID] = struct{}{}
-
-			if le.Err != nil && !errors.Is(le.Err, ErrNotFound) {
-				continue
-			}
-
-			if c.store(le, nowMillis) {
-				added++
-			}
-		}
-
-		for _, ID := range batch {
-			if _, ok := loaded[ID]; !ok {
-				c.store(LoadedEntry[T]{ID: ID, Err: ErrNotFound}, nowMillis)
-			}
-
-			c.pending.Delete(ID)
-		}
-
-		batch = batch[:0]
 	}
 
-	for _, ID := range IDs {
-		// claim the ID through the same gate the refresh workers use
-		if _, alreadyPending := c.pending.LoadOrStore(ID, struct{}{}); alreadyPending {
-			continue
-		}
-
-		batch = append(batch, ID)
-		if len(batch) >= c.refreshBatchSize {
-			flush()
-		}
-
-		if ctx.Err() != nil {
-			break
-		}
-	}
-
-	flush()
-
-	return
-}
-
-func (c *Cache[T]) callLoaderFor(ctx context.Context, IDs []int64) (entries []LoadedEntry[T], err error) {
-	if c.loadMultipleFunc != nil {
-		return c.loadMultipleFunc(ctx, IDs)
-	}
-
-	entries = make([]LoadedEntry[T], 0, len(IDs))
-	for _, ID := range IDs {
-		value, version, loadErr := c.loadOneFunc(ctx, ID)
-		entries = append(entries, LoadedEntry[T]{ID: ID, Value: value, Version: version, Err: loadErr})
-	}
-
-	return entries, nil
+	c.enqueue(ID)
 }

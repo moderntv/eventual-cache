@@ -1,84 +1,69 @@
 package eventual
 
-import (
-	"sync"
-	"testing"
-	"unsafe"
+import "testing"
 
-	"github.com/stretchr/testify/assert"
-)
+func TestEntryHoldsTheValueAndItsFlags(t *testing.T) {
+	first := &testItem{ID: 1, Name: "first"}
 
-func TestEntry(t *testing.T) {
-	t.Run("older_version_never_wins", testEntryOlderVersionNeverWins)
-	t.Run("concurrent_highest_version_wins", testEntryConcurrentHighestVersionWins)
-	t.Run("without_versions_last_write_wins", testEntryWithoutVersions)
-	t.Run("size", testEntrySize)
-}
+	e := newEntry(first, 1234)
 
-func testUpdate(name string, version int64) update[testItem] {
-	return update[testItem]{value: &testItem{Name: name}, version: version}
-}
+	if e.value.Load() != first {
+		t.Fatalf("newEntry did not store the value")
+	}
 
-// A slow writer must not overwrite a value stored by a writer with a higher
-// version. `go test -race` cannot catch this - every operation on its own is
-// atomic, only their order would be wrong.
-func testEntryOlderVersionNeverWins(t *testing.T) {
-	t.Parallel()
+	if e.refreshAt.Load() != 1234 {
+		t.Fatalf("newEntry did not store refreshAt")
+	}
 
-	e := newEntry(testUpdate("v100", 100))
+	if e.invalidated.Load() {
+		t.Fatalf("a fresh entry must not be marked for a reload")
+	}
 
-	_, applied := e.apply(testUpdate("v102", 102))
-	assert.True(t, applied)
+	if e.markedForDeletion.Load() {
+		t.Fatalf("a fresh entry must not be marked for deletion")
+	}
 
-	_, applied = e.apply(testUpdate("v101", 101))
-	assert.False(t, applied)
+	second := &testItem{ID: 1, Name: "second"}
+	e.value.Store(second)
 
-	assert.Equal(t, "v102", e.value.Load().Name)
-	assert.Equal(t, int64(102), e.version.Load())
-}
-
-func testEntryConcurrentHighestVersionWins(t *testing.T) {
-	t.Parallel()
-
-	const (
-		rounds  = 200
-		writers = 32
-	)
-
-	for round := 0; round < rounds; round++ {
-		e := newEntry(testUpdate("v0", 0))
-		e.version.Store(0)
-
-		wg := sync.WaitGroup{}
-		for v := 1; v <= writers; v++ {
-			wg.Add(1)
-
-			go func(version int64) {
-				defer wg.Done()
-
-				e.apply(update[testItem]{value: &testItem{ID: version}, version: version})
-			}(int64(v))
-		}
-		wg.Wait()
-
-		assert.Equal(t, int64(writers), e.version.Load(), "round %d", round)
-		assert.Equal(t, int64(writers), e.value.Load().ID, "round %d", round)
+	if e.value.Load() != second {
+		t.Fatalf("the value was not replaced")
 	}
 }
 
-func testEntryWithoutVersions(t *testing.T) {
-	t.Parallel()
+func TestPendingIDsDeduplicatesAndDrains(t *testing.T) {
+	p := newPendingIDs()
 
-	e := newEntry(testUpdate("first", 0))
+	got := p.add(1)
+	if got != 1 {
+		t.Fatalf("expected size 1, got %d", got)
+	}
 
-	_, applied := e.apply(testUpdate("second", 0))
-	assert.True(t, applied)
-	assert.Equal(t, "second", e.value.Load().Name)
-}
+	got = p.add(1)
+	if got != 1 {
+		t.Fatalf("adding the same ID twice must not grow the set, got %d", got)
+	}
 
-func testEntrySize(t *testing.T) {
-	t.Parallel()
+	got = p.add(2)
+	if got != 2 {
+		t.Fatalf("expected size 2, got %d", got)
+	}
 
-	t.Logf("entry=%d B (independent of the value type)", unsafe.Sizeof(entry[testItem]{}))
-	assert.Equal(t, unsafe.Sizeof(entry[testItem]{}), unsafe.Sizeof(entry[[512]byte]{}))
+	drained := p.drain(nil)
+	if len(drained) != 2 {
+		t.Fatalf("expected 2 drained IDs, got %d", len(drained))
+	}
+
+	if p.size() != 0 {
+		t.Fatalf("drain must empty the set")
+	}
+
+	// drain appends to the given buffer and reuses its capacity
+	buf := make([]int64, 0, 4)
+	p.add(7)
+
+	drained = p.drain(buf)
+	if len(drained) != 1 || drained[0] != 7 {
+		t.Fatalf("unexpected drain result: %v", drained)
+	}
 }

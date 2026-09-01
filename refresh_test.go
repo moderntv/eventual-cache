@@ -1,190 +1,387 @@
 package eventual
 
 import (
+	"context"
 	"errors"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
-func TestRefresh(t *testing.T) {
-	t.Run("concurrent_misses_are_deduplicated", testRefreshConcurrentMissesDeduplicated)
-	t.Run("requests_spread_in_time_are_deduplicated", testRefreshSpreadInTimeDeduplicated)
-	t.Run("requests_are_batched", testRefreshRequestsAreBatched)
-	t.Run("load_error_keeps_previous_value", testRefreshLoadErrorKeepsPreviousValue)
-	t.Run("full_queue_does_not_block", testRefreshFullQueueDoesNotBlock)
-	t.Run("miss_rate_limit", testRefreshMissRateLimit)
-	t.Run("load_one_fallback", testRefreshLoadOneFallback)
-}
-
-func testRefreshConcurrentMissesDeduplicated(t *testing.T) {
-	t.Parallel()
-
+func TestInvalidateDoesNotHitTheSourceSynchronously(t *testing.T) {
 	source := newTestSource(10)
-	source.loadDelay.Store(int64(30 * time.Millisecond))
-
-	c := newTestCache(t, source, nil)
-
-	const unknownID = 4_000_001
-
-	wg := sync.WaitGroup{}
-	for i := 0; i < 1000; i++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			c.Get(unknownID)
-		}()
-	}
-	wg.Wait()
-
-	assert.True(t, waitFor(2*time.Second, func() bool { return source.requestCount(unknownID) > 0 }))
-	time.Sleep(150 * time.Millisecond)
-
-	assert.LessOrEqual(t, source.requestCount(unknownID), 2,
-		"1000 concurrent lookups of one unknown ID must not become 1000 loads")
-}
-
-// The original design deduplicated with singleflight behind the queue, which does
-// nothing when the duplicates arrive one after another. The gate in front of the
-// queue has to collapse those too.
-func testRefreshSpreadInTimeDeduplicated(t *testing.T) {
-	t.Parallel()
-
-	source := newTestSource(10)
-	source.loadDelay.Store(int64(40 * time.Millisecond))
-
 	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.RefreshWorkers = 1
+		p.Timeouts.RefreshInterval = time.Hour
 	})
-
-	const ID = int64(7)
-
-	for i := 0; i < 300; i++ {
-		c.Invalidate(ID)
-		time.Sleep(time.Millisecond)
-	}
-
-	assert.True(t, waitFor(3*time.Second, func() bool { return c.Stats().QueueLength == 0 }))
-	time.Sleep(150 * time.Millisecond)
-
-	requests := source.requestCount(ID)
-	t.Logf("300 invalidations spread over ~300 ms produced %d loads", requests)
-	assert.Less(t, requests, 30, "invalidations arriving one by one have to be collapsed as well")
-	assert.Greater(t, requests, 0)
-}
-
-func testRefreshRequestsAreBatched(t *testing.T) {
-	t.Parallel()
-
-	source := newTestSource(1000)
-	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.RefreshWorkers = 1
-		p.RefreshBatchSize = 100
-		p.RefreshBatchDelay = 20 * time.Millisecond
-	})
-
-	IDs := make([]int64, 0, 1000)
-	for i := 0; i < 1000; i++ {
-		IDs = append(IDs, int64(1+i*6))
-	}
 
 	before := source.loadMultipleCalls.Load()
-	c.InvalidateMultiple(IDs)
 
-	assert.True(t, waitFor(5*time.Second, func() bool { return source.totalRequests() >= 1000 }))
+	c.Invalidate(1)
 
-	calls := source.loadMultipleCalls.Load() - before
-	t.Logf("1000 invalidations took %d loader calls", calls)
-	assert.LessOrEqual(t, calls, int64(40), "invalidations have to reach the loader in batches")
+	got := source.loadMultipleCalls.Load()
+	if got != before {
+		t.Fatalf("Invalidate loaded synchronously")
+	}
 }
 
-func testRefreshLoadErrorKeepsPreviousValue(t *testing.T) {
-	t.Parallel()
-
+func TestInvalidationsAreLoadedInOneBatch(t *testing.T) {
 	source := newTestSource(10)
-	c := newTestCache(t, source, nil)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+	})
 
-	assert.Equal(t, "item", c.Get(7).Name)
+	before := source.loadMultipleCalls.Load()
 
-	setErr(&source.loadErr, errors.New("connection reset"))
-	source.set(7, "never seen")
+	source.set(1, "changed")
+	source.set(7, "changed")
+	source.set(13, "changed")
+
+	c.Invalidate(1)
+	c.Invalidate(7)
+	c.Invalidate(13)
+
+	ok := waitFor(5*time.Second, func() bool { return name(c, 13) == "changed" })
+	if !ok {
+		t.Fatalf("the invalidated items were not reloaded")
+	}
+
+	if name(c, 1) != "changed" || name(c, 7) != "changed" {
+		t.Fatalf("only part of the batch was reloaded")
+	}
+
+	got := source.loadMultipleCalls.Load() - before
+	if got != 1 {
+		t.Fatalf("expected 1 batch load for 3 invalidations, got %d", got)
+	}
+}
+
+func TestRepeatedInvalidationOfTheSameIDCollapses(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 50 * time.Millisecond
+	})
+
+	before := source.requestCount(1)
+
+	for i := 0; i < 100; i++ {
+		c.Invalidate(1)
+	}
+
+	ok := waitFor(5*time.Second, func() bool { return source.requestCount(1) > before })
+	if !ok {
+		t.Fatalf("item 1 was never reloaded")
+	}
+
+	// one run of the loop may ask the source for the ID exactly once
+	got := source.requestCount(1) - before
+	if got != 1 {
+		t.Fatalf("100 invalidations asked the source %d times", got)
+	}
+}
+
+func TestAFullBatchIsLoadedWithoutWaitingForTheTick(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.BatchSize = 3
+		// only a full batch can trigger the load
+		p.Timeouts.RefreshInterval = time.Hour
+	})
+
+	source.set(1, "changed")
+
+	c.Invalidate(1)
+	c.Invalidate(7)
+	c.Invalidate(13)
+
+	ok := waitFor(5*time.Second, func() bool { return name(c, 1) == "changed" })
+	if !ok {
+		t.Fatalf("a full batch did not trigger a load")
+	}
+}
+
+func TestInvalidateRemovesAnItemTheSourceNoLongerHas(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+	})
+
+	source.remove(7)
 	c.Invalidate(7)
 
-	time.Sleep(200 * time.Millisecond)
-
-	if assert.NotNil(t, c.Get(7), "a failed load must never remove an item") {
-		assert.Equal(t, "item", c.Get(7).Name)
+	ok := waitFor(5*time.Second, func() bool { return c.Get(7) == nil })
+	if !ok {
+		t.Fatalf("item 7 is still in the replica")
 	}
-	assert.Equal(t, 10, c.Len())
 
-	// once the source recovers, the next invalidation goes through
+	if c.Get(1) == nil {
+		t.Fatalf("item 1 was removed too")
+	}
+}
+
+func TestInvalidateLoadsAnItemTheReplicaDoesNotHaveYet(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+	})
+
+	source.set(999, "brand new")
+	c.Invalidate(999)
+
+	ok := waitFor(5*time.Second, func() bool { return name(c, 999) == "brand new" })
+	if !ok {
+		t.Fatalf("the new item was not loaded")
+	}
+}
+
+func TestFailedReloadKeepsTheItemMarkedAndTheValueIntact(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+	})
+
+	setErr(&source.loadErr, errors.New("source down"))
+	source.set(1, "changed")
+
+	before := source.loadMultipleCalls.Load()
+	c.Invalidate(1)
+
+	// a failed batch is retried, so the invalidation is not lost
+	ok := waitFor(5*time.Second, func() bool { return source.loadMultipleCalls.Load() >= before+2 })
+	if !ok {
+		t.Fatalf("the failed batch was not retried")
+	}
+
+	if name(c, 1) != "item" {
+		t.Fatalf("a failed load changed the value to %q", name(c, 1))
+	}
+
 	setErr(&source.loadErr, nil)
+
+	ok = waitFor(5*time.Second, func() bool { return name(c, 1) == "changed" })
+	if !ok {
+		t.Fatalf("the item was not reloaded after the source recovered")
+	}
+}
+
+// TestPerItemErrorDoesNotRemoveTheItem covers a loader that answers with an error
+// for one ID: the cache must not read that as "the source lost it".
+func TestPerItemErrorDoesNotRemoveTheItem(t *testing.T) {
+	source := newTestSource(3)
+
+	failing := errors.New("row is locked")
+
+	// the error starts only after the warm-up, so item 7 gets into the replica
+	// first and we can watch whether the failed reload throws it out
+	var failItem7 atomic.Bool
+
+	calls := atomic.Int64{}
+
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+		p.LoadMultipleFunc = func(ctx context.Context, IDs []int64) ([]LoadedEntry[testItem], error) {
+			calls.Add(1)
+
+			entries := make([]LoadedEntry[testItem], 0, len(IDs))
+			for _, ID := range IDs {
+				if ID == 7 && failItem7.Load() {
+					entries = append(entries, LoadedEntry[testItem]{ID: ID, Err: failing})
+
+					continue
+				}
+
+				value := &testItem{ID: ID, Name: "item"}
+				entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: value})
+			}
+
+			return entries, nil
+		}
+	})
+
+	if c.Get(7) == nil {
+		t.Fatalf("item 7 was never loaded")
+	}
+
+	failItem7.Store(true)
+
+	before := calls.Load()
 	c.Invalidate(7)
 
-	assert.True(t, waitFor(3*time.Second, func() bool { return c.Get(7).Name == "never seen" }))
-}
-
-func testRefreshFullQueueDoesNotBlock(t *testing.T) {
-	t.Parallel()
-
-	source := newTestSource(500)
-	source.loadDelay.Store(int64(200 * time.Millisecond))
-
-	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.RefreshWorkers = 1
-		p.RefreshQueueSize = 4
-		p.RefreshBatchSize = 1
-	})
-
-	IDs := make([]int64, 0, 500)
-	for i := 0; i < 500; i++ {
-		IDs = append(IDs, int64(1+i*6))
+	ok := waitFor(5*time.Second, func() bool { return calls.Load() > before })
+	if !ok {
+		t.Fatalf("the invalidated item was never reloaded")
 	}
 
-	start := time.Now()
-	c.InvalidateMultiple(IDs)
-	elapsed := time.Since(start)
+	time.Sleep(100 * time.Millisecond)
 
-	assert.Less(t, elapsed, 500*time.Millisecond, "a full queue has to drop requests, not block the caller")
-	assert.Equal(t, 500, c.Len())
+	if c.Get(7) == nil {
+		t.Fatalf("a per item error removed the item")
+	}
 }
 
-func testRefreshMissRateLimit(t *testing.T) {
-	t.Parallel()
+// TestNotFoundErrorRemovesTheItem is the other half: ErrNotFound is proof.
+func TestNotFoundErrorRemovesTheItem(t *testing.T) {
+	source := newTestSource(3)
 
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
+		p.LoadMultipleFunc = func(ctx context.Context, IDs []int64) ([]LoadedEntry[testItem], error) {
+			entries := make([]LoadedEntry[testItem], 0, len(IDs))
+			for _, ID := range IDs {
+				if ID == 7 {
+					entries = append(entries, LoadedEntry[testItem]{ID: ID, Err: ErrNotFound})
+
+					continue
+				}
+
+				value := &testItem{ID: ID, Name: "item"}
+				entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: value})
+			}
+
+			return entries, nil
+		}
+	})
+
+	if c.Get(7) != nil {
+		t.Fatalf("an ErrNotFound answer must not put the item in the replica")
+	}
+
+	if c.Get(1) == nil {
+		t.Fatalf("item 1 is missing")
+	}
+}
+
+// TestGetQueuesUnknownIDs is the behaviour asked for explicitly: Get returns nil
+// straight away, but the ID lands in the queue and the goroutine tries it.
+func TestGetQueuesUnknownIDs(t *testing.T) {
 	source := newTestSource(10)
 	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.MissRateLimit = 2
-		p.Timeouts.NotFoundTTL = 0 // do not remember the answers
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
 	})
 
-	for i := 0; i < 500; i++ {
-		c.Get(int64(5_000_000 + i))
+	// the source got a new item and nobody told the cache
+	source.set(999, "appeared")
+
+	if c.Get(999) != nil {
+		t.Fatalf("Get must return nil for an item the replica does not have")
 	}
 
+	ok := waitFor(5*time.Second, func() bool { return name(c, 999) == "appeared" })
+	if !ok {
+		t.Fatalf("the Get of an unknown ID did not queue a load")
+	}
+}
+
+func TestGetOfANonexistentIDIsRateLimited(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.MissRateLimit = 5
+		p.Timeouts.RefreshInterval = time.Hour
+	})
+
+	for i := int64(0); i < 1000; i++ {
+		// IDs the source does not have either
+		if c.Get(100000+i) != nil {
+			t.Fatalf("Get returned an item the source does not have")
+		}
+	}
+
+	// the limiter starts with a full bucket of MissRateLimit tokens
+	got := c.pending.size()
+	if got > 6 {
+		t.Fatalf("1000 lookups queued %d IDs, the limit is 5 per second", got)
+	}
+}
+
+func TestInvalidateIsNotRateLimited(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.MissRateLimit = 1
+		p.Timeouts.RefreshInterval = time.Hour
+	})
+
+	for i := int64(0); i < 100; i++ {
+		c.Invalidate(100000 + i)
+	}
+
+	got := c.pending.size()
+	if got != 100 {
+		t.Fatalf("expected 100 pending IDs, got %d", got)
+	}
+}
+
+func TestExpiredTTLKeepsServingTheValueAndQueuesAReload(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.TTL = 10 * time.Millisecond
+		p.Timeouts.RefreshInterval = time.Hour // only Get may trigger the reload
+	})
+
+	source.set(1, "changed")
+
+	// wait for the TTL and for the coarse clock to notice
 	time.Sleep(300 * time.Millisecond)
 
-	total := source.totalRequests()
-	t.Logf("500 lookups of unknown IDs with a limit of 2/s produced %d loads", total)
-	assert.LessOrEqual(t, total, 10, "lookups of unknown IDs have to be rate limited")
+	// the value is still served even though it is stale
+	got := name(c, 1)
+	if got != "item" {
+		t.Fatalf("an expired item must still be served, got %q", got)
+	}
+
+	ok := waitFor(5*time.Second, func() bool { return c.pending.size() > 0 })
+	if !ok {
+		t.Fatalf("the expired item was not queued for a reload")
+	}
+
+	e, exists := c.entryOf(1)
+	if !exists {
+		t.Fatalf("item 1 disappeared")
+	}
+
+	if !e.invalidated.Load() {
+		t.Fatalf("the expired item is not marked")
+	}
 }
 
-func testRefreshLoadOneFallback(t *testing.T) {
-	t.Parallel()
-
+func TestExpiredTTLIsReloadedByTheGoroutine(t *testing.T) {
 	source := newTestSource(10)
 	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.LoadMultipleFunc = nil
+		p.Timeouts.TTL = 10 * time.Millisecond
+		p.Timeouts.RefreshInterval = 20 * time.Millisecond
 	})
 
-	source.set(7, "via load one")
-	c.Invalidate(7)
+	source.set(1, "changed")
 
-	assert.True(t, waitFor(3*time.Second, func() bool { return c.Get(7).Name == "via load one" }))
-	assert.Greater(t, source.loadOneCalls.Load(), int64(0))
-	assert.Zero(t, source.loadMultipleCalls.Load())
+	// the reload needs a Get to notice the TTL first
+	ok := waitFor(5*time.Second, func() bool {
+		_ = c.Get(1)
+
+		return name(c, 1) == "changed"
+	})
+	if !ok {
+		t.Fatalf("the stale item was never reloaded")
+	}
+}
+
+// TestNoTTLMeansNoAutomaticReload makes sure TTL 0 keeps the cache quiet.
+func TestNoTTLMeansNoAutomaticReload(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.TTL = 0
+		p.Timeouts.RefreshInterval = 5 * time.Millisecond
+	})
+
+	before := source.loadMultipleCalls.Load()
+
+	for i := 0; i < 100; i++ {
+		for _, ID := range testIDs(10) {
+			_ = c.Get(ID)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	got := source.loadMultipleCalls.Load()
+	if got != before {
+		t.Fatalf("reads triggered %d loads with no TTL set", got-before)
+	}
 }
