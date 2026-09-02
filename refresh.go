@@ -6,20 +6,13 @@ import (
 	"github.com/moderntv/eventual-cache/internal/utils"
 )
 
-const (
-	// clockInterval is how often the coarse clock read by Get and by the miss rate
-	// limiter is updated. It is the precision of the TTL, which is measured in
-	// minutes at least, so 100ms is plenty.
-	clockInterval = 100 * time.Millisecond
-
-	// metricsInterval is how often the shard read counters are collected into
-	// Prometheus.
-	metricsInterval = time.Second
-)
+// metricsInterval is how often the shard read counters are collected into
+// Prometheus.
+const metricsInterval = time.Second
 
 // run is the only background goroutine of the cache. It reloads marked items,
-// periodically reconciles the replica with the source, keeps the coarse clock
-// moving and collects the shard counters into Prometheus.
+// periodically reconciles the replica with the source and collects the shard
+// counters into Prometheus.
 //
 // Reloading and reconciliation share one goroutine on purpose: a reconciliation
 // can then never interleave with a reload, which is one less race to reason
@@ -35,9 +28,6 @@ func (c *Cache[T]) run() {
 
 	syncTimer := time.NewTimer(utils.RandomizeDuration(c.timeouts.SyncInterval, c.timeouts.Randomizer))
 	defer syncTimer.Stop()
-
-	clockTicker := time.NewTicker(clockInterval)
-	defer clockTicker.Stop()
 
 	// receiving from a nil channel blocks forever, which is how the metrics ticker
 	// stays switched off when there is no registry
@@ -65,9 +55,6 @@ func (c *Cache[T]) run() {
 			c.sync(c.ctx, l)
 			syncTimer.Reset(utils.RandomizeDuration(c.timeouts.SyncInterval, c.timeouts.Randomizer))
 
-		case <-clockTicker.C:
-			c.updateClock()
-
 		case <-metricsCh:
 			c.collectMetrics(mc)
 		}
@@ -75,9 +62,9 @@ func (c *Cache[T]) run() {
 }
 
 // reloadMarked loads every item currently in the pending set: items marked by
-// Invalidate, items whose TTL has passed, and IDs a Get asked for and the replica
-// did not have. IDs whose load failed are marked again, so the next run tries
-// them.
+// Invalidate, items a reconciliation found outdated, and IDs a Get asked for and
+// the replica did not have. IDs whose load failed are marked again, so the next
+// run tries them.
 func (c *Cache[T]) reloadMarked(l *loader[T]) {
 	l.IDs = c.pending.drain(l.IDs[:0])
 	if len(l.IDs) == 0 {

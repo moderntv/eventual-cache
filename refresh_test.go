@@ -309,64 +309,11 @@ func TestInvalidateIsNotRateLimited(t *testing.T) {
 	}
 }
 
-func TestExpiredTTLKeepsServingTheValueAndQueuesAReload(t *testing.T) {
+// TestReadsOfKnownItemsNeverTriggerLoads makes sure the read path really is
+// read-only: a hit queues nothing, however often it is repeated.
+func TestReadsOfKnownItemsNeverTriggerLoads(t *testing.T) {
 	source := newTestSource(10)
 	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.Timeouts.TTL = 10 * time.Millisecond
-		p.Timeouts.RefreshInterval = time.Hour // only Get may trigger the reload
-	})
-
-	source.set(1, "changed")
-
-	// wait for the TTL and for the coarse clock to notice
-	time.Sleep(300 * time.Millisecond)
-
-	// the value is still served even though it is stale
-	got := name(c, 1)
-	if got != "item" {
-		t.Fatalf("an expired item must still be served, got %q", got)
-	}
-
-	ok := waitFor(5*time.Second, func() bool { return c.pending.size() > 0 })
-	if !ok {
-		t.Fatalf("the expired item was not queued for a reload")
-	}
-
-	e, exists := c.entryOf(1)
-	if !exists {
-		t.Fatalf("item 1 disappeared")
-	}
-
-	if !e.invalidated.Load() {
-		t.Fatalf("the expired item is not marked")
-	}
-}
-
-func TestExpiredTTLIsReloadedByTheGoroutine(t *testing.T) {
-	source := newTestSource(10)
-	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.Timeouts.TTL = 10 * time.Millisecond
-		p.Timeouts.RefreshInterval = 20 * time.Millisecond
-	})
-
-	source.set(1, "changed")
-
-	// the reload needs a Get to notice the TTL first
-	ok := waitFor(5*time.Second, func() bool {
-		_ = c.Get(1)
-
-		return name(c, 1) == "changed"
-	})
-	if !ok {
-		t.Fatalf("the stale item was never reloaded")
-	}
-}
-
-// TestNoTTLMeansNoAutomaticReload makes sure TTL 0 keeps the cache quiet.
-func TestNoTTLMeansNoAutomaticReload(t *testing.T) {
-	source := newTestSource(10)
-	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.Timeouts.TTL = 0
 		p.Timeouts.RefreshInterval = 5 * time.Millisecond
 	})
 
@@ -382,6 +329,6 @@ func TestNoTTLMeansNoAutomaticReload(t *testing.T) {
 
 	got := source.loadMultipleCalls.Load()
 	if got != before {
-		t.Fatalf("reads triggered %d loads with no TTL set", got-before)
+		t.Fatalf("reads of known items triggered %d loads", got-before)
 	}
 }

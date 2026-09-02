@@ -196,7 +196,6 @@ func TestCacheWorksWithoutMetrics(t *testing.T) {
 		p.MetricsRegistry = nil
 		p.Timeouts.SyncInterval = 20 * time.Millisecond
 		p.Timeouts.RefreshInterval = 20 * time.Millisecond
-		p.Timeouts.TTL = 10 * time.Millisecond
 		p.afterSync = watcher.hook()
 	})
 

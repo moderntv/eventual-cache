@@ -29,10 +29,11 @@ type Metrics struct {
 	LoadErrorsCount     prometheus.Counter
 	ListIDsErrorsCount  prometheus.Counter
 
-	SyncRunsCount    prometheus.Counter
-	SyncAddedCount   prometheus.Counter
-	SyncMarkedCount  prometheus.Counter
-	SyncRemovedCount prometheus.Counter
+	SyncRunsCount     prometheus.Counter
+	SyncAddedCount    prometheus.Counter
+	SyncMarkedCount   prometheus.Counter
+	SyncRemovedCount  prometheus.Counter
+	SyncOutdatedCount prometheus.Counter
 }
 
 func New(
@@ -85,6 +86,10 @@ func New(
 		{&m.SyncAddedCount, "sync_added", "Items loaded by reconciliation because the replica did not have them"},
 		{&m.SyncMarkedCount, "sync_marked", "Items marked for deletion by reconciliation"},
 		{&m.SyncRemovedCount, "sync_removed", "Items removed by reconciliation"},
+		{
+			&m.SyncOutdatedCount, "sync_outdated",
+			"Items reloaded by reconciliation because the source reported a newer version",
+		},
 	}
 
 	for _, c := range counters {

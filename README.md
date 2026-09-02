@@ -6,9 +6,9 @@ up to date in the background; reads are served from local memory and **never
 block on I/O**.
 
 The cache knows nothing about where the data comes from. It only needs two
-functions: one that lists the IDs the source currently has, and one that loads a
-batch of items by ID. Anything that can answer those two questions can back the
-cache.
+functions: one that lists the IDs the source currently has together with their
+versions, and one that loads a batch of items by ID. Anything that can answer
+those two questions can back the cache.
 
 The value type `T` is generic, the key is always `int64`.
 
@@ -31,20 +31,20 @@ reconciliation do the bulk work.
 
 Everything below happens in **one** background goroutine. Reloads and
 reconciliation therefore never interleave, which is one less race to reason about
-and costs nothing — both are background work with no latency budget.
+and costs nothing — both are background work with no latency budget. Only the
+batches inside a single load run are parallel, see `LoadConcurrency`.
 
 **1. Initial load.** `New` calls `ListIDsFunc` to get every ID the source has and
 then loads them through `LoadMultipleFunc` in batches of `BatchSize`. It returns
 only once all batches are stored, or with an error.
 
-**2. Marking.** Four things put an ID on the list of items to load:
+**2. Marking.** Three things put an ID on the list of items to load:
 
 | Trigger | Rate limited |
 |---|---|
 | `Invalidate(ID)` from the caller | no |
-| The `TTL` of an item passed and somebody called `Get` on it | no |
+| A reconciliation found a newer version, or an ID the replica does not have | no |
 | `Get(ID)` for an ID the replica does not have | **yes**, `MissRateLimit`/s |
-| A reconciliation found an ID the replica does not have | no |
 
 Marking is cheap and never touches the source: a flag on the item plus the ID in
 a set. Repeated marks of the same ID between two runs collapse into one load.
@@ -74,51 +74,99 @@ natsConn.Subscribe("cache.item.updated", func(msg *nats.Msg) {
 ```
 
 **4. Periodic reconciliation.** Every `SyncInterval` the cache fetches the list of
-all IDs again, removes items the source no longer has and loads items the replica
-does not have yet. It does **not** re-read the content of items the replica
-already holds — that is what invalidations and the TTL are for. It is the safety
-net for lost invalidations.
+all IDs and versions again and compares it against the replica. It removes items
+the source no longer has, loads items the replica does not have yet, and marks
+items whose version in the source is newer than the stored one. It is the safety
+net for invalidations that never arrived.
 
-## TTL — a refresh interval, not an expiration
+The reconciliation only *decides*; the reloads it queues are performed by the
+next refresh tick, like any other invalidation.
 
-`Timeouts.TTL` is how long a value is considered fresh. Once it passes, the next
-`Get` **still returns the value** and only marks the item for a reload on its way
-out. The reload then happens in the background like any other.
+## Versions — how a lost invalidation is caught
 
-An item is therefore never dropped because it is old — only because the source
-stopped having it. A stale value is always better than no value here: the caller
-asked a cache, not the database.
+Invalidation over a message bus is best-effort: a message can be dropped, and
+nothing in the replica would ever notice. That is what `Version` is for.
 
-The TTL of each item is randomized by at least ±10 % (more with a bigger
-`Randomizer`), so that the items stored together by the initial load do not all
-come due in the same instant.
+`ListIDsFunc` reports a version along with every ID, and `LoadMultipleFunc`
+reports the version of the content it returns. When a reconciliation sees a
+version greater than the one stored with the value, it reloads the item.
+**`SyncInterval` is therefore the upper bound on how long a lost invalidation can
+leave a stale value in the replica** — not some multiple of an item's age.
 
-With `TTL` left at 0 values are only reloaded when somebody invalidates them or a
-reconciliation notices they are missing.
+The version is typically the unix microseconds of an `updated_at` column, but any
+value that grows with every change will do. It is only ever compared against
+another version **from the same source**, never against a clock of ours, so
+neither the scale nor the clock of the machine running the cache matters:
 
-The TTL check in `Get` reads a coarse clock the background goroutine updates every
-100 ms. A `time.Now()` call on the read path would cost more than the whole rest
-of `Get`; 100 ms of imprecision on a TTL measured in minutes costs nothing.
+```sql
+SELECT id, UNIX_TIMESTAMP(updated_at) * 1000000 FROM items
+```
+
+Two things worth getting right:
+
+-   **Use the same scale in both functions.** If `ListIDsFunc` reports real
+    versions and `LoadMultipleFunc` leaves `Version` at 0, every reconciliation
+    finds every item outdated and reloads the whole replica. Watch `sync_outdated`.
+-   **Give the timestamp sub-second precision** (`DATETIME(6)`), or two changes
+    within the same second collapse into one version and the second one is missed.
+
+Reporting the version from `LoadMultipleFunc` is also what keeps an invalidation
+from being done twice: without it the stored version would stay behind, and the
+next reconciliation would reload everything the invalidations had just loaded.
+
+Leaving `Version` at 0 everywhere switches change detection off — items are then
+only reloaded by an explicit `Invalidate`.
+
+An item is never dropped because it is old, only because the source stopped
+having it. There is no TTL and no expiration: a stale value is always better than
+no value here, because the caller asked a cache, not the database.
 
 ## What the source has to provide
 
 ```go
-// ListIDsFunc returns the IDs of all items the source currently has. Called by
-// the initial load and by every reconciliation, so it should be cheap.
-type ListIDsFunc func(ctx context.Context) (IDs []int64, err error)
+// ListIDsFunc returns every item the source currently has, as an ID and a
+// version. Called by the initial load and by every reconciliation, so it should
+// be cheap.
+type ListIDsFunc func(ctx context.Context) (items []SourceItem, err error)
+
+type SourceItem struct {
+	ID      int64
+	Version int64
+}
 
 // LoadMultipleFunc loads a batch of items in one call.
 type LoadMultipleFunc[T any] func(ctx context.Context, IDs []int64) (entries []LoadedEntry[T], err error)
 
 type LoadedEntry[T any] struct {
-	ID    int64
-	Value *T
-	Err   error
+	ID      int64
+	Value   *T
+	Version int64
+	Err     error
 }
 ```
 
 Both are required. `LoadMultipleFunc` is always called with at most `BatchSize`
-IDs.
+IDs, and **from several goroutines at once** — see `LoadConcurrency`.
+
+### Timeouts are yours to set
+
+The cache passes its own context to both functions and never adds a deadline. It
+cannot pick one for you: only you know what a reasonable duration is for your
+source.
+
+Do set one. Everything in the background — reloads, reconciliation, the metrics —
+runs in a single goroutine, so **one call that hangs stops all of it** for as
+long as it hangs. Reads keep being served from the replica the whole time, but it
+stops being updated.
+
+```go
+ListIDsFunc: func(ctx context.Context) ([]eventual.SourceItem, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	return source.ItemIDs(ctx)
+},
+```
 
 ## When an item is removed
 
@@ -137,7 +185,8 @@ again. A broken source degrades the freshness of the replica, never its content.
 
 The reconciliation works from a snapshot of IDs, so it cannot delete on the spot.
 The first run that does not find an ID only **marks** the item; the next run that
-still does not find it deletes it.
+still does not find it deletes it. A deleted item therefore disappears from the
+replica within two `SyncInterval`s.
 
 One run is not enough evidence. An item loaded while the reconciliation was
 running is naturally missing from the snapshot it started with, and the ID listing
@@ -147,6 +196,19 @@ serving `nil` for something the caller can see in the database.
 
 A successful load clears the mark, so an item that gets invalidated between two
 reconciliations is never deleted.
+
+## Failed loads and retries
+
+A batch that fails is retried three times with a growing backoff before the run
+gives up. That matters for the warm-up: a large dataset is hundreds of calls, and
+failing the start-up because one of them was unlucky is not acceptable.
+
+Steady state barely needs it — a run that gives up leaves its IDs marked and the
+next `RefreshInterval` tick tries them again anyway.
+
+The first batch that fails all of its attempts ends the run, and the batches
+still in flight are cancelled through their context. A source that is down
+therefore costs one failed batch per worker per run, not one per batch.
 
 ## Caveats
 
@@ -179,7 +241,7 @@ func MultiplyShiftHash(ID int64, bits uint) uint32 {
 }
 ```
 
-It costs about 0.7 ns, and because it takes the top bits it stays uniform even
+It costs about 0.5 ns, and because it takes the top bits it stays uniform even
 when the IDs form an arithmetic progression — which is the common shape of
 auto-increment IDs, and the case where masking the low bits (`ID & (shards-1)`)
 leaves most shards permanently empty.
@@ -196,24 +258,27 @@ roughly twice as slow). `Params.ShardHash` takes any function with the
 -   **Name** — used in logs and metrics. Required.
 -   **MetricsRegistry** — `*cadre_metrics.Registry`; when set, Prometheus metrics
     are registered. Optional.
--   **ListIDsFunc** — lists all IDs the source has. Required.
+-   **ListIDsFunc** — lists all IDs and versions the source has. Required.
 -   **LoadMultipleFunc** — loads a batch of items by ID. Required.
 -   **BatchSize** — maximum number of IDs per `LoadMultipleFunc` call. Applies to
     the initial load, to reloads of marked items and to the reconciliation.
     Reaching this many marked IDs also wakes the background goroutine early.
-    Default 200.
+    Default 1000.
+-   **LoadConcurrency** — how many batches of one load run are in flight at once.
+    Default 4; 1 loads them one after another. A run with a single batch never
+    starts a goroutine.
 -   **MissRateLimit** — how many IDs unknown to the replica `Get` may queue per
-    second. Default 100, zero or less means no limit.
+    second. Default 100; a negative value means no limit.
 -   **Shards** — power of two, default 256.
 -   **ShardHash** — default `MultiplyShiftHash`.
 -   **Timeouts** — see below.
 
 ### Timeouts
 
--   **SyncInterval** — how often the reconciliation runs. Randomized by
+-   **SyncInterval** — how often the reconciliation runs, and therefore the upper
+    bound on how long a lost invalidation can go unnoticed. Randomized by
     `Randomizer`. Required, must be > 0.
 -   **RefreshInterval** — how often marked items are reloaded. Default 1s.
--   **TTL** — how long a value is considered fresh, see above. Default 0 (off).
 -   **Randomizer** — `[0, 1]`. 0 = no jitter, 0.1 = ±10 %. Without it every
     instance of the service would hit the source in the same second.
 
@@ -232,12 +297,12 @@ label `name`):
 | `misses_count` | Counter | `Get` calls for an ID the replica does not have |
 | `misses_rate_limited` | Counter | Lookups of unknown IDs dropped by the rate limit |
 | `invalidations_count` | Counter | `Invalidate` calls |
-| `batch_loads` | Counter | `LoadMultipleFunc` calls |
+| `batch_loads` | Counter | `LoadMultipleFunc` calls, retries included |
 | `batch_load_items` | Counter | IDs passed to `LoadMultipleFunc` |
 | `error_loads` | Counter | Loads that failed with something other than not found |
 | `list_ids_errors` | Counter | `ListIDsFunc` calls that failed |
 | `sync_runs` | Counter | Reconciliation runs |
-| `sync_added` / `sync_marked` / `sync_removed` | Counter | What the reconciliations did |
+| `sync_added` / `sync_marked` / `sync_removed` / `sync_outdated` | Counter | What the reconciliations did |
 
 `reads_count` and `misses_count` are counted **per shard** and collected into
 Prometheus once a second by the background goroutine. Incrementing a Prometheus
@@ -246,8 +311,9 @@ exactly what the sharding is there to avoid. Everything else is counted where th
 event happens.
 
 Worth alerting on: `time() - last_sync_timestamp` above a few sync intervals,
-`list_ids_errors` growing, `misses_rate_limited` growing, and a `pending_count`
-that does not come back down.
+`list_ids_errors` growing, `misses_rate_limited` growing, a `pending_count` that
+does not come back down, and a `sync_outdated` in the order of the whole dataset
+(which means the two `Version`s are not on the same scale).
 
 ---
 
@@ -266,13 +332,14 @@ import (
 )
 
 type Item struct {
-	ID   int64
-	Name string
+	ID        int64
+	Name      string
+	UpdatedAt time.Time
 }
 
 // Source is whatever holds the data - a database, an HTTP API, a file.
 type Source interface {
-	ItemIDs(ctx context.Context) ([]int64, error)
+	ItemIDs(ctx context.Context) ([]eventual.SourceItem, error)
 	Items(ctx context.Context, IDs []int64) ([]Item, error)
 }
 
@@ -292,9 +359,18 @@ func NewRepository(
 		MetricsRegistry: metrics,
 		Name:            "item",
 
-		ListIDsFunc: source.ItemIDs,
+		// SELECT id, UNIX_TIMESTAMP(updated_at) * 1000000 FROM items
+		ListIDsFunc: func(ctx context.Context) ([]eventual.SourceItem, error) {
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+
+			return source.ItemIDs(ctx)
+		},
 
 		LoadMultipleFunc: func(ctx context.Context, IDs []int64) ([]eventual.LoadedEntry[Item], error) {
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+
 			items, err := source.Items(ctx, IDs)
 			if err != nil {
 				return nil, err
@@ -306,6 +382,8 @@ func NewRepository(
 				entries = append(entries, eventual.LoadedEntry[Item]{
 					ID:    items[i].ID,
 					Value: &items[i],
+					// the same scale as SourceItem.Version above
+					Version: items[i].UpdatedAt.UnixMicro(),
 				})
 			}
 
@@ -315,12 +393,12 @@ func NewRepository(
 		Timeouts: eventual.Timeouts{
 			SyncInterval:    5 * time.Minute,
 			RefreshInterval: time.Second,
-			TTL:             10 * time.Minute,
 			Randomizer:      0.1,
 		},
 
-		BatchSize: 200,
-		Shards:    1024, // 64 core machine
+		BatchSize:       1000,
+		LoadConcurrency: 4,
+		Shards:          1024, // 64 core machine
 	})
 	if err != nil {
 		return nil, err
@@ -341,6 +419,44 @@ func (r *Repository) Invalidate(IDs []int64) {
 func (r *Repository) Close() { r.cache.Close() }
 ```
 
+## Sizing a large replica
+
+Measured on an i5-11500H with **1 000 000 items**, 1024 shards:
+
+| | |
+|---|---|
+| The replica itself | 59 MB, i.e. **62 B per item** on top of your values |
+| Reconciliation buffers | 46 MB, allocated on the first run and kept |
+| One reconciliation | ~170 ms of CPU, spread over `GOMAXPROCS` |
+
+The buffers are reused between runs on purpose, so that a reconciliation does not
+allocate proportionally to the dataset — the 46 MB never comes back. Budget
+around **105 MB of overhead per million items** plus the values themselves, and
+set `GOMEMLIMIT`: a million entries is a million pointers for the GC to mark.
+
+`ListIDsFunc` returns the whole ID list on every run, so `SyncInterval` is also
+how often the source is asked for all of it. Ten to fifteen minutes is a
+reasonable starting point for a dataset this size; keep `Randomizer` non-zero so
+that the instances do not all ask at the same moment.
+
+### Warm-up
+
+`New` does not return until the whole dataset is in memory, so this is start-up
+time for every instance on every deploy. Loading 1 000 000 items from a source
+that takes 5 ms per call:
+
+| BatchSize | LoadConcurrency | Warm-up |
+|---|---|---|
+| 200 | 1 | 27.5 s |
+| 1000 | 1 | 6.2 s |
+| **1000** | **4** | **1.6 s** ← defaults |
+| 1000 | 8 | 0.84 s |
+| 5000 | 4 | 0.43 s |
+
+Bigger batches do most of the work — they cut the number of round trips — and
+concurrency overlaps what is left. Past that the floor is your source: streaming
+a million rows takes what it takes.
+
 ## Benchmarks
 
 All numbers from an i5-11500H (6 cores / 12 threads, 2.9 GHz), 200 000 items,
@@ -348,18 +464,17 @@ All numbers from an i5-11500H (6 cores / 12 threads, 2.9 GHz), 200 000 items,
 
 ### How many reads per second
 
-Measured with metrics registered and a TTL set, so the read path pays for the
-shard counter and the coarse clock check. Two access patterns, because that is
-what decides the answer: a random walk over the whole dataset misses the CPU
-caches on every lookup, a skewed workload with a small hot set does not. Real
-traffic sits between them.
+Measured with metrics registered, so the read path pays for the shard counter.
+Two access patterns, because that is what decides the answer: a random walk over
+the whole dataset misses the CPU caches on every lookup, a skewed workload with a
+small hot set does not. Real traffic sits between them.
 
 | Readers | Random over 200 000 items | Hot set of 1 000 items |
 |---|---|---|
-| 1 | **9.6 M reads/s** (105 ns) | **49 M reads/s** (20 ns) |
-| 4 | 25 M reads/s (40 ns) | 99 M reads/s (10 ns) |
-| 8 | 53 M reads/s (19 ns) | – |
-| 12 | **62 M reads/s** (16 ns) | **141 M reads/s** (7.1 ns) |
+| 1 | **9.4 M reads/s** (106 ns) | **50 M reads/s** (20 ns) |
+| 4 | 25 M reads/s (39 ns) | 104 M reads/s (9.6 ns) |
+| 8 | 53 M reads/s (19 ns) | 130 M reads/s (7.7 ns) |
+| 12 | **63 M reads/s** (16 ns) | **133 M reads/s** (7.5 ns) |
 
 The random walk is bound by memory latency: a lookup is a chain of dependent
 cache misses (shard → map bucket → entry → value), so nothing can be prefetched.
@@ -369,36 +484,61 @@ more outstanding misses, not more arithmetic.
 The hot set is bound by the `RLock`/`RUnlock` pair instead. It is a
 read-modify-write on the shard's cache line, so the line bounces between cores.
 Raising the shard count does **not** help: measured over the hot set, 256 → 16 384
-shards takes throughput *down* from 144 to 117 M reads/s, because the shard array
-itself stops fitting in cache. Around 7 ns per read is the floor of a sharded
-`RWMutex` map on this machine.
+shards takes throughput *down*, because the shard array itself stops fitting in
+cache. Around 7 ns per read is the floor of a sharded `RWMutex` map on this
+machine.
 
 ```bash
-go test -run='^$' -bench=Throughput -benchtime=3s -cpu=1,2,4,8,12 .
+go test -run='^$' -bench=Throughput -benchtime=3s -cpu=1,4,8,12 .
 ```
+
+### The miss path
+
+A flood of lookups for IDs that do not exist is the one read path a caller can
+point at the cache on purpose, so it has to behave under concurrency:
+
+| Readers | Hit | Miss |
+|---|---|---|
+| 1 | 37.2 ns | 84.7 ns |
+| 4 | 11.6 ns | 28.4 ns |
+| 12 | **6.6 ns** | **12.8 ns** |
+
+Two things shape that column. The rate limiter answers from a plain shared read
+once the second's budget is used up, instead of an atomic read-modify-write on
+one globally shared cache line — that is the difference between a miss path that
+scales with the cores and one that gets *slower* the more of them you use, which
+is what it did before (36.4 ns at 12 threads, and heading the wrong way).
+
+The rest is the `time.Now()` the limiter's window needs. It is deliberately not
+cached in a field the background goroutine ticks: that goroutine also does the
+I/O, so a slow source would stop the clock and with it the window, and every miss
+would be rejected until the source recovered. A hit never pays for it.
+
+Note that the cost of `time.Now()` belongs to the host, not to this code. These
+numbers are from a machine whose clocksource is `tsc`; where the kernel falls
+back to `acpi_pm` or `hpet`, a clock read costs hundreds of nanoseconds and this
+column grows accordingly.
 
 ### Everything else
 
 | Benchmark | ns/op | allocs/op |
 |---|---|---|
-| `Get` (serial, sequential walk) | 34.9 | 0 |
-| `Get` (parallel, sequential walk) | 6.3 | 0 |
-| `Get` (parallel, metrics registered) | 6.4 | 0 |
-| `Get` (parallel, TTL set) | 6.5 | 0 |
-| `Get` (parallel, **1 shard** — what a bad hash does) | 52.3 | 0 |
-| `Get` (miss, rate limiter on the path) | 43.5 | 0 |
-| `Invalidate` (same ID, collapsed by the flag) | 16.4 | 0 |
-| `Invalidate` (distinct IDs) | 63.1 | 0 |
-| Reconciliation over 200 000 items | 34.5 ms | 37 |
+| `Get` (serial, sequential walk) | 36.8 | 0 |
+| `Get` (parallel, sequential walk) | 6.8 | 0 |
+| `Get` (parallel, metrics registered) | 7.2 | 0 |
+| `Get` (parallel, **1 shard** — what a bad hash does) | 55.1 | 0 |
+| `Invalidate` (same ID, collapsed by the flag) | 15.7 | 0 |
+| `Invalidate` (distinct IDs) | 117.8 | 0 |
+| Reconciliation over 200 000 items | 45.0 ms | 37 |
+| `MultiplyShiftHash` / `SplitMix64Hash` | 0.49 / 1.12 | 0 |
 
-Metrics and TTL are both free on the read path — that is the point of the per
-shard counters and of the coarse clock. A single shard is 8× slower than 256,
-which is what the shard hash is for.
+Metrics are free on the read path — that is the point of the per shard counters.
+A single shard is 9× slower than 256, which is what the shard hash is for.
 
 The reconciliation reuses its buffers between runs, so its allocation count does
-not grow with the size of the dataset. Its 1.6 MB per run is the `[]int64` of
-200 000 IDs that `ListIDsFunc` returns — the test source allocates it fresh every
-time, the cache itself does not.
+not grow with the size of the dataset. Its 3.2 MB per run is the `[]SourceItem`
+of 200 000 IDs and versions that `ListIDsFunc` returns — the test source
+allocates it fresh every time, the cache itself does not.
 
 ```bash
 go test -run='^$' -bench=. -benchmem .

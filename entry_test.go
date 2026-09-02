@@ -11,8 +11,8 @@ func TestEntryHoldsTheValueAndItsFlags(t *testing.T) {
 		t.Fatalf("newEntry did not store the value")
 	}
 
-	if e.refreshAt.Load() != 1234 {
-		t.Fatalf("newEntry did not store refreshAt")
+	if e.version.Load() != 1234 {
+		t.Fatalf("newEntry did not store the version")
 	}
 
 	if e.invalidated.Load() {

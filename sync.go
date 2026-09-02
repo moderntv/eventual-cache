@@ -11,13 +11,17 @@ type syncStats struct {
 	Added    int
 	Marked   int
 	Removed  int
+	Outdated int
 	Duration time.Duration
 }
 
 // sync reconciles the replica with the source: items the source no longer has
-// are removed, items the replica does not have yet are loaded. It does not
-// re-read the content of items the replica already holds - that is what
-// invalidations and the TTL are for.
+// are removed, items the replica does not have yet are loaded, and items the
+// source reports with a newer version are queued for a reload. It is the safety
+// net for invalidations that never arrived.
+//
+// It only decides what to do - the reloads it queues are performed by the next
+// refresh tick, like any other invalidation.
 //
 // Only run() calls it, so the buffers on the Cache need no lock.
 func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
@@ -31,7 +35,7 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 		c.metrics.SyncRunsCount.Inc()
 	}
 
-	IDs, err := c.listIDsFunc(ctx)
+	items, err := c.listIDsFunc(ctx)
 	if err != nil {
 		c.log.Warn().Err(err).Msg("listing source IDs failed, replica left untouched")
 
@@ -43,18 +47,19 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 	}
 
 	clear(c.available)
-	for _, ID := range IDs {
-		c.available[ID] = struct{}{}
+	for _, item := range items {
+		c.available[item.ID] = item.Version
 	}
 
-	marked, removed := c.sweep()
-	added := c.fill(ctx, l, IDs)
+	marked, removed, outdated := c.sweep()
+	added := c.fill(ctx, l, items)
 
 	stats := syncStats{
-		Total:    len(IDs),
+		Total:    len(items),
 		Added:    added,
 		Marked:   marked,
 		Removed:  removed,
+		Outdated: outdated,
 		Duration: time.Since(start),
 	}
 
@@ -63,6 +68,7 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 		Int("added", stats.Added).
 		Int("marked", stats.Marked).
 		Int("removed", stats.Removed).
+		Int("outdated", stats.Outdated).
 		Int64("items", c.itemsCount.Load()).
 		Float64("duration_s", stats.Duration.Seconds()).
 		Msg("reconciliation finished")
@@ -70,28 +76,36 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 	c.finishSync(stats)
 }
 
-// sweep deals with the items the source did not report.
+// sweep walks the replica and compares it against what the source reported.
 //
-// Deletion takes two runs. The first run that does not find an ID only marks the
-// item; the next run that still does not find it deletes it. One run is not
-// enough evidence: an item loaded while the reconciliation was running is
-// naturally missing from the ID snapshot the run started with, and the ID listing
-// itself can be a stale read from a replica. Keeping a deleted item for one extra
-// interval is the cheaper mistake - dropping an item that really exists means
-// serving nil for it.
-func (c *Cache[T]) sweep() (marked, removed int) {
+// An item the source did not report at all is deleted, but only on the second
+// run in a row that does not find it. One run is not enough evidence: an item
+// loaded while the reconciliation was running is naturally missing from the ID
+// snapshot the run started with, and the ID listing itself can be a stale read
+// from a replica. Keeping a deleted item for one extra interval is the cheaper
+// mistake - dropping an item that really exists means serving nil for it.
+//
+// An item the source reports with a version newer than the stored one is marked
+// for a reload, which is how a lost invalidation is eventually noticed. The
+// reload itself goes through the same machinery as Invalidate.
+func (c *Cache[T]) sweep() (marked, removed, outdated int) {
 	c.forEachShardParallel(func(index int, sh *shard[T]) {
 		toDelete := c.shardDelete[index][:0]
+		toReload := c.shardReload[index][:0]
 		localMarked := 0
 
 		sh.mu.RLock()
 		for ID, e := range sh.data {
-			_, inSource := c.available[ID]
+			version, inSource := c.available[ID]
 			if inSource {
 				// a plain load first - storing into every entry on every run would
 				// dirty every cache line in the replica
 				if e.markedForDeletion.Load() {
 					e.markedForDeletion.Store(false)
+				}
+
+				if version > e.version.Load() {
+					toReload = append(toReload, ID)
 				}
 
 				continue
@@ -110,14 +124,27 @@ func (c *Cache[T]) sweep() (marked, removed int) {
 
 		localRemoved := c.removeMarked(sh, toDelete)
 
+		// marking takes the pending mutex, so it happens outside the shard lock
+		for _, ID := range toReload {
+			e, exists := c.entryOf(ID)
+			if !exists {
+				continue
+			}
+
+			c.markEntry(ID, e)
+		}
+
 		c.shardDelete[index] = toDelete
+		c.shardReload[index] = toReload
 		c.shardCounts[index].marked = localMarked
 		c.shardCounts[index].removed = localRemoved
+		c.shardCounts[index].outdated = len(toReload)
 	})
 
 	for i := range c.shardCounts {
 		marked += c.shardCounts[i].marked
 		removed += c.shardCounts[i].removed
+		outdated += c.shardCounts[i].outdated
 	}
 
 	return
@@ -158,8 +185,8 @@ func (c *Cache[T]) removeMarked(sh *shard[T], IDs []int64) (removed int) {
 }
 
 // fill loads the items the source has and the replica does not.
-func (c *Cache[T]) fill(ctx context.Context, l *loader[T], IDs []int64) (added int) {
-	missing := c.collectMissing(IDs)
+func (c *Cache[T]) fill(ctx context.Context, l *loader[T], items []SourceItem) (added int) {
+	missing := c.collectMissing(items)
 	if len(missing) == 0 {
 		return 0
 	}
@@ -175,14 +202,14 @@ func (c *Cache[T]) fill(ctx context.Context, l *loader[T], IDs []int64) (added i
 // collectMissing returns the IDs the source has and the replica does not. It
 // walks the shards in parallel, because on a large dataset this is the most
 // expensive part of a reconciliation.
-func (c *Cache[T]) collectMissing(IDs []int64) (missing []int64) {
+func (c *Cache[T]) collectMissing(items []SourceItem) (missing []int64) {
 	for i := range c.shardIDs {
 		c.shardIDs[i] = c.shardIDs[i][:0]
 	}
 
-	for _, ID := range IDs {
-		index := c.shardHash(ID, c.shardBits)
-		c.shardIDs[index] = append(c.shardIDs[index], ID)
+	for _, item := range items {
+		index := c.shardHash(item.ID, c.shardBits)
+		c.shardIDs[index] = append(c.shardIDs[index], item.ID)
 	}
 
 	c.forEachShardParallel(func(index int, sh *shard[T]) {
@@ -219,6 +246,7 @@ func (c *Cache[T]) finishSync(stats syncStats) {
 	c.metrics.SyncAddedCount.Add(float64(stats.Added))
 	c.metrics.SyncMarkedCount.Add(float64(stats.Marked))
 	c.metrics.SyncRemovedCount.Add(float64(stats.Removed))
+	c.metrics.SyncOutdatedCount.Add(float64(stats.Outdated))
 	c.metrics.LastSyncDuration.Set(stats.Duration.Seconds())
 	c.metrics.LastSyncTimestamp.Set(float64(time.Now().Unix()))
 }

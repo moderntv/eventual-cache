@@ -26,14 +26,6 @@ func TestPublicAPI(t *testing.T) {
 func TestNewLoadsTheWholeDatasetInBatches(t *testing.T) {
 	source := newTestSource(10)
 
-	maxBatch := 0
-	hook := func(IDs []int64) {
-		if len(IDs) > maxBatch {
-			maxBatch = len(IDs)
-		}
-	}
-	source.onLoad.Store(&hook)
-
 	c := newTestCache(t, source, func(p *Params[testItem]) {
 		p.BatchSize = 4
 	})
@@ -49,8 +41,8 @@ func TestNewLoadsTheWholeDatasetInBatches(t *testing.T) {
 		t.Fatalf("expected 3 batch loads, got %d", got)
 	}
 
-	if maxBatch > 4 {
-		t.Fatalf("the loader was called with %d IDs, BatchSize is 4", maxBatch)
+	if source.maxBatch.Load() > 4 {
+		t.Fatalf("the loader was called with %d IDs, BatchSize is 4", source.maxBatch.Load())
 	}
 
 	for _, ID := range testIDs(10) {
@@ -99,7 +91,6 @@ func TestNewValidatesParams(t *testing.T) {
 		{"shards not a power of two", func(p *Params[testItem]) { p.Shards = 100 }},
 		{"negative batch size", func(p *Params[testItem]) { p.BatchSize = -1 }},
 		{"no sync interval", func(p *Params[testItem]) { p.Timeouts.SyncInterval = 0 }},
-		{"negative ttl", func(p *Params[testItem]) { p.Timeouts.TTL = -time.Second }},
 		{"randomizer above one", func(p *Params[testItem]) { p.Timeouts.Randomizer = 1.5 }},
 	}
 
@@ -119,7 +110,7 @@ func TestStoreAndRemove(t *testing.T) {
 
 	item := &testItem{ID: 999, Name: "new"}
 
-	added := c.store(999, item)
+	added := c.store(999, item, 1)
 	if !added {
 		t.Fatalf("store of a new ID must report it as added")
 	}
@@ -130,7 +121,7 @@ func TestStoreAndRemove(t *testing.T) {
 
 	replacement := &testItem{ID: 999, Name: "replaced"}
 
-	added = c.store(999, replacement)
+	added = c.store(999, replacement, 2)
 	if added {
 		t.Fatalf("store of a known ID must not report it as added")
 	}
@@ -158,15 +149,13 @@ func TestStoreAndRemove(t *testing.T) {
 // because the source stopped having it, never because it got old.
 func TestItemsHaveNoExpiration(t *testing.T) {
 	source := newTestSource(3)
-	c := newTestCache(t, source, func(p *Params[testItem]) {
-		p.Timeouts.TTL = time.Millisecond
-	})
+	c := newTestCache(t, source, nil)
 
 	time.Sleep(50 * time.Millisecond)
 
 	for _, ID := range testIDs(3) {
 		if c.Get(ID) == nil {
-			t.Fatalf("item %d was dropped after its TTL passed", ID)
+			t.Fatalf("item %d was dropped while the source still had it", ID)
 		}
 	}
 
@@ -233,7 +222,6 @@ func TestGetIsSafeUnderConcurrentReloads(t *testing.T) {
 		p.MetricsRegistry = test_utils.MetricsRegistry()
 		p.Timeouts.RefreshInterval = time.Millisecond
 		p.Timeouts.SyncInterval = 5 * time.Millisecond
-		p.Timeouts.TTL = 2 * time.Millisecond
 		p.BatchSize = 7
 	})
 

@@ -3,16 +3,44 @@ package eventual
 import (
 	"context"
 	"errors"
+	"time"
 
 	cadre_metrics "github.com/moderntv/cadre/metrics"
 	"github.com/rs/zerolog"
 )
 
 const (
-	defaultShards        = 256
-	defaultBatchSize     = 200
-	defaultMissRateLimit = 100
+	defaultShards          = 256
+	defaultBatchSize       = 1000
+	defaultMissRateLimit   = 100
+	defaultLoadConcurrency = 4
+
+	// A batch is retried a few times before the run gives up. It is what keeps a
+	// warm-up of a large dataset - thousands of calls - from failing because one
+	// of them was unlucky. Steady state does not really need it: the IDs stay
+	// marked and the next refresh tick tries them again.
+	defaultLoadRetries      = 3
+	defaultLoadRetryBackoff = 100 * time.Millisecond
 )
+
+// SourceItem is one item as reported by ListIDsFunc: its ID and the version of
+// the content the source currently holds for it.
+type SourceItem struct {
+	ID int64
+	// Version identifies the content of the item. The reconciliation reloads an
+	// item when the version reported here is greater than the version of the
+	// value the replica holds, which is what catches an invalidation that never
+	// arrived.
+	//
+	// Typically the unix microseconds of an updated_at column, but any value that
+	// grows with every change will do - it is only ever compared against another
+	// version from the same source, never against a clock of ours. Use the same
+	// scale in LoadedEntry.Version.
+	//
+	// Leave it at 0 everywhere to switch change detection off; items are then
+	// only reloaded by Invalidate.
+	Version int64
+}
 
 // LoadedEntry is one item returned by a loader.
 type LoadedEntry[T any] struct {
@@ -20,6 +48,10 @@ type LoadedEntry[T any] struct {
 	// Value is the loaded item. A nil Value - or Err set to ErrNotFound - means
 	// the source does not have the item any more and the cache removes it.
 	Value *T
+	// Version is the version of the returned content, on the same scale as
+	// SourceItem.Version. Reporting it here is what keeps a reload triggered by
+	// Invalidate from being repeated by the next reconciliation.
+	Version int64
 	// Err is a per item error. Anything other than ErrNotFound leaves the item in
 	// the replica untouched, because a failed load is not proof of anything.
 	Err error
@@ -31,12 +63,15 @@ type (
 	// result is treated the same as ErrNotFound and the item is removed from the
 	// replica. A non-nil error means the whole batch failed and the replica is
 	// left untouched.
+	//
+	// It is called from several goroutines at once, see Params.LoadConcurrency.
 	LoadMultipleFunc[T any] func(ctx context.Context, IDs []int64) (entries []LoadedEntry[T], err error)
 
-	// ListIDsFunc returns the IDs of all items the source currently has. It is
-	// called by the initial load and by every reconciliation, so it should be as
-	// cheap as possible (typically SELECT id FROM ...).
-	ListIDsFunc func(ctx context.Context) (IDs []int64, err error)
+	// ListIDsFunc returns every item the source currently has, as an ID and a
+	// version. It is called by the initial load and by every reconciliation, so
+	// it should be as cheap as possible (typically
+	// SELECT id, updated_at FROM ...).
+	ListIDsFunc func(ctx context.Context) (items []SourceItem, err error)
 )
 
 type Params[T any] struct {
@@ -65,20 +100,32 @@ type Params[T any] struct {
 	// call. It applies to the initial load, to reloads of marked items and to the
 	// reconciliation. Reaching BatchSize marked items also wakes the background
 	// goroutine before its next tick.
-	// Default 200.
+	// Default 1000.
 	BatchSize int
+
+	// LoadConcurrency is how many batches of one load run are in flight at once.
+	// It matters most for the warm-up, which is the only run big enough for the
+	// round trips to add up; a run with a single batch never starts a goroutine.
+	// Note that LoadMultipleFunc is therefore called from several goroutines.
+	// Default 4, 1 loads batches one after another.
+	LoadConcurrency int
 
 	// MissRateLimit caps how many IDs unknown to the replica may be queued for a
 	// load per second by Get, so that lookups for random IDs cannot overload the
-	// source. Invalidations, expired TTLs and the reconciliation are never rate
-	// limited.
-	// Default 100, zero or less means no limit.
+	// source. Invalidations and the reconciliation are never rate limited.
+	// Default 100; a negative value means no limit.
 	MissRateLimit int
 
 	// afterSync is called at the end of every reconciliation. It exists for tests
 	// which need to know that a reconciliation has finished, which is why it is
 	// not exported.
 	afterSync func()
+
+	// loadRetries and loadRetryBackoff are how a failing batch is retried. They
+	// are not exported because there is no good reason to tune them from the
+	// outside; tests set them to keep their runtime down.
+	loadRetries      int
+	loadRetryBackoff time.Duration
 }
 
 func (p *Params[T]) check() error {
@@ -106,6 +153,10 @@ func (p *Params[T]) check() error {
 		return errors.New("batchSize cannot be negative")
 	}
 
+	if p.LoadConcurrency < 0 {
+		return errors.New("loadConcurrency cannot be negative")
+	}
+
 	return p.Timeouts.check()
 }
 
@@ -124,6 +175,18 @@ func (p *Params[T]) withDefaults() {
 
 	if p.MissRateLimit == 0 {
 		p.MissRateLimit = defaultMissRateLimit
+	}
+
+	if p.LoadConcurrency == 0 {
+		p.LoadConcurrency = defaultLoadConcurrency
+	}
+
+	if p.loadRetries == 0 {
+		p.loadRetries = defaultLoadRetries
+	}
+
+	if p.loadRetryBackoff == 0 {
+		p.loadRetryBackoff = defaultLoadRetryBackoff
 	}
 
 	p.Timeouts.withDefaults()

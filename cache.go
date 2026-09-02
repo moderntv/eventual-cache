@@ -10,13 +10,13 @@ import (
 	"github.com/rs/zerolog"
 
 	metrics_pkg "github.com/moderntv/eventual-cache/internal/metrics"
-	"github.com/moderntv/eventual-cache/internal/utils"
 )
 
 // Cache is an eventually consistent in-memory replica of a whole dataset keyed
 // by int64. Reads never block on I/O; the replica is kept up to date by
-// invalidations from the caller, by the TTL of the items and by periodic
-// reconciliation with the source.
+// invalidations from the caller and by periodic reconciliation with the source,
+// which compares item versions and so also catches invalidations that were lost
+// on the way.
 type Cache[T any] struct {
 	// static attributes (do not change their value after initialization)
 	ctx       context.Context
@@ -27,6 +27,10 @@ type Cache[T any] struct {
 	timeouts  Timeouts
 	batchSize int
 	afterSync func()
+
+	loadConcurrency  int
+	loadRetries      int
+	loadRetryBackoff time.Duration
 
 	listIDsFunc      ListIDsFunc
 	loadMultipleFunc LoadMultipleFunc[T]
@@ -41,17 +45,14 @@ type Cache[T any] struct {
 	pending   *pendingIDs
 	batchFull chan struct{}
 
-	// nowMillis is a coarse clock updated by the background goroutine. Reading it
-	// is one atomic load, which is what makes the TTL check in Get affordable -
-	// a time.Now() call there would cost more than the whole rest of Get.
-	nowMillis  atomic.Int64
 	itemsCount atomic.Int64
 
 	// buffers reused between reconciliation runs. Only the background goroutine
 	// touches them, so they need no lock.
-	available    map[int64]struct{}
+	available    map[int64]int64 // ID -> version the source lists
 	shardIDs     [][]int64
 	shardDelete  [][]int64
+	shardReload  [][]int64
 	shardMissing [][]int64
 	shardCounts  []syncShardCounts
 	syncMissing  []int64
@@ -92,6 +93,10 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 		batchSize: params.BatchSize,
 		afterSync: params.afterSync,
 
+		loadConcurrency:  params.LoadConcurrency,
+		loadRetries:      params.loadRetries,
+		loadRetryBackoff: params.loadRetryBackoff,
+
 		listIDsFunc:      params.ListIDsFunc,
 		loadMultipleFunc: params.LoadMultipleFunc,
 
@@ -104,9 +109,10 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 		pending:   newPendingIDs(),
 		batchFull: make(chan struct{}, 1),
 
-		available:    make(map[int64]struct{}),
+		available:    make(map[int64]int64),
 		shardIDs:     make([][]int64, params.Shards),
 		shardDelete:  make([][]int64, params.Shards),
+		shardReload:  make([][]int64, params.Shards),
 		shardMissing: make([][]int64, params.Shards),
 		shardCounts:  make([]syncShardCounts, params.Shards),
 	}
@@ -114,8 +120,6 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 	for i := range c.shards {
 		c.shards[i].data = make(map[int64]*entry[T])
 	}
-
-	c.updateClock()
 
 	// blocking warm-up - the replica must be complete before anybody reads it
 	err = c.warmUp(ctx)
@@ -142,9 +146,6 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 // A nil result means either that the source does not have the item, or that the
 // replica does not know about it yet. The ID is queued for a background load, so
 // a later Get can already succeed.
-//
-// When the TTL of the item has passed, Get still returns the value and only
-// marks the item for a reload on the way out.
 func (c *Cache[T]) Get(ID int64) *T {
 	sh := c.shardOf(ID)
 
@@ -164,14 +165,7 @@ func (c *Cache[T]) Get(ID int64) *T {
 		return nil
 	}
 
-	value := e.value.Load()
-
-	refreshAt := e.refreshAt.Load()
-	if refreshAt != 0 && refreshAt <= c.nowMillis.Load() {
-		c.markEntry(ID, e)
-	}
-
-	return value
+	return e.value.Load()
 }
 
 // Invalidate marks the item for a reload. It does not load anything itself: the
@@ -208,9 +202,9 @@ func (c *Cache[T]) Close() {
 
 // markEntry marks an item the caller already has the entry of.
 func (c *Cache[T]) markEntry(ID int64, e *entry[T]) {
-	// a plain load first: a CompareAndSwap is a locked instruction and would
-	// dirty the cache line on every Get in the window between the TTL passing and
-	// the actual reload
+	// a plain load first: a CompareAndSwap is a locked instruction, and repeated
+	// marks of the same item are common - a burst of invalidations for one ID, or
+	// a reconciliation marking something Invalidate already did
 	if e.invalidated.Load() {
 		return
 	}
@@ -225,8 +219,13 @@ func (c *Cache[T]) markEntry(ID int64, e *entry[T]) {
 
 // markUnknown queues an ID the replica does not hold. This is the one path a
 // caller can trigger at will with arbitrary IDs, so it is rate limited.
+//
+// The clock is read here and not kept in a field the background goroutine ticks:
+// that goroutine also does the I/O, so a slow source would stop the clock, and
+// with it the limiter's window - every miss would then be rejected until the
+// source recovered. Only a miss pays for the call, never a hit.
 func (c *Cache[T]) markUnknown(ID int64) {
-	allowed := c.missLimiter.allow(c.nowMillis.Load())
+	allowed := c.missLimiter.allow(time.Now().UnixMilli())
 	if !allowed {
 		if c.metrics != nil {
 			c.metrics.MissesRateLimitedCount.Inc()
@@ -265,12 +264,10 @@ func (c *Cache[T]) entryOf(ID int64) (e *entry[T], exists bool) {
 // store inserts or replaces an item. Replacing the value of an existing item
 // only needs the shard read lock, because the pointer to the entry stays the
 // same.
-func (c *Cache[T]) store(ID int64, value *T) (added bool) {
-	refreshAt := c.nextRefreshAt()
-
+func (c *Cache[T]) store(ID int64, value *T, version int64) (added bool) {
 	e, exists := c.entryOf(ID)
 	if exists {
-		c.updateEntry(e, value, refreshAt)
+		c.updateEntry(e, value, version)
 
 		return false
 	}
@@ -280,13 +277,13 @@ func (c *Cache[T]) store(ID int64, value *T) (added bool) {
 	sh.mu.Lock()
 	e, exists = sh.data[ID]
 	if !exists {
-		sh.data[ID] = newEntry(value, refreshAt)
+		sh.data[ID] = newEntry(value, version)
 	}
 	sh.mu.Unlock()
 
 	// somebody inserted it between the two locks
 	if exists {
-		c.updateEntry(e, value, refreshAt)
+		c.updateEntry(e, value, version)
 
 		return false
 	}
@@ -297,8 +294,9 @@ func (c *Cache[T]) store(ID int64, value *T) (added bool) {
 }
 
 // updateEntry puts a freshly loaded value into an existing entry.
-func (c *Cache[T]) updateEntry(e *entry[T], value *T, refreshAt int64) {
-	e.refreshAt.Store(refreshAt)
+func (c *Cache[T]) updateEntry(e *entry[T], value *T, version int64) {
+	e.version.Store(version)
+
 	// a successful load is proof the source has the item
 	if e.markedForDeletion.Load() {
 		e.markedForDeletion.Store(false)
@@ -330,35 +328,24 @@ func (c *Cache[T]) remove(ID int64) (removed bool) {
 	return true
 }
 
-// nextRefreshAt returns the coarse timestamp at which a value stored now should
-// be reloaded, or 0 when no TTL is configured.
-func (c *Cache[T]) nextRefreshAt() int64 {
-	if c.timeouts.TTL <= 0 {
-		return 0
-	}
-
-	ttl := utils.RandomizeDuration(c.timeouts.TTL, c.timeouts.ttlRandomizer())
-
-	return c.nowMillis.Load() + ttl.Milliseconds()
-}
-
-func (c *Cache[T]) updateClock() {
-	c.nowMillis.Store(time.Now().UnixMilli())
-}
-
 // warmUp fills the replica: it lists every ID the source has and loads them in
 // batches. New blocks on it and fails when it fails, so that a service never
 // starts serving from an incomplete replica.
 func (c *Cache[T]) warmUp(ctx context.Context) (err error) {
 	start := time.Now()
 
-	IDs, err := c.listIDsFunc(ctx)
+	items, err := c.listIDsFunc(ctx)
 	if err != nil {
 		if c.metrics != nil {
 			c.metrics.ListIDsErrorsCount.Inc()
 		}
 
 		return fmt.Errorf("listing source IDs failed: %w", err)
+	}
+
+	IDs := make([]int64, len(items))
+	for i := range items {
+		IDs[i] = items[i].ID
 	}
 
 	added, _, err := c.newLoader().loadAll(ctx, IDs)

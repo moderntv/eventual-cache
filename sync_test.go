@@ -230,13 +230,7 @@ func TestSyncLoadsMissingItemsInBatches(t *testing.T) {
 		p.afterSync = watcher.hook()
 	})
 
-	maxBatch := 0
-	hook := func(IDs []int64) {
-		if len(IDs) > maxBatch {
-			maxBatch = len(IDs)
-		}
-	}
-	source.onLoad.Store(&hook)
+	source.maxBatch.Store(0)
 
 	for i := int64(0); i < 20; i++ {
 		source.set(1000+i, "appeared")
@@ -249,8 +243,8 @@ func TestSyncLoadsMissingItemsInBatches(t *testing.T) {
 		t.Fatalf("expected 22 items, got %d", got)
 	}
 
-	if maxBatch > 4 {
-		t.Fatalf("the reconciliation called the loader with %d IDs, BatchSize is 4", maxBatch)
+	if source.maxBatch.Load() > 4 {
+		t.Fatalf("the reconciliation called the loader with %d IDs, BatchSize is 4", source.maxBatch.Load())
 	}
 }
 
@@ -275,5 +269,114 @@ func TestSyncBuffersDoNotGrowWithRuns(t *testing.T) {
 
 	if cap(c.syncMissing) != firstCap {
 		t.Fatalf("the missing buffer grew from %d to %d over 20 runs", firstCap, cap(c.syncMissing))
+	}
+}
+
+// TestSyncReloadsItemWhoseVersionGrew is the safety net for a lost invalidation:
+// the source bumped the version and never told us, so only the reconciliation
+// can notice.
+func TestSyncReloadsItemWhoseVersionGrew(t *testing.T) {
+	source := newTestSource(10)
+	watcher := newSyncWatcher()
+
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.SyncInterval = 20 * time.Millisecond
+		p.Timeouts.RefreshInterval = 5 * time.Millisecond
+		p.afterSync = watcher.hook()
+	})
+
+	// no Invalidate call anywhere - this is the message that got lost
+	source.set(7, "changed")
+
+	ok := waitFor(5*time.Second, func() bool { return name(c, 7) == "changed" })
+	if !ok {
+		t.Fatalf("the reconciliation did not reload an item whose version grew")
+	}
+}
+
+// TestSyncLeavesUnchangedItemsAlone is the other half: a reconciliation over a
+// dataset that did not change must not reload anything. Without this the
+// version check would turn every sync into a full reload of the replica.
+func TestSyncLeavesUnchangedItemsAlone(t *testing.T) {
+	source := newTestSource(10)
+	watcher := newSyncWatcher()
+
+	newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.SyncInterval = 20 * time.Millisecond
+		p.Timeouts.RefreshInterval = 5 * time.Millisecond
+		p.afterSync = watcher.hook()
+	})
+
+	watcher.wait(t, 1)
+
+	before := source.loadMultipleCalls.Load()
+
+	watcher.wait(t, 3)
+	time.Sleep(50 * time.Millisecond)
+
+	got := source.loadMultipleCalls.Load()
+	if got != before {
+		t.Fatalf("reconciliations over an unchanged dataset triggered %d loads", got-before)
+	}
+}
+
+// TestSyncIgnoresAVersionOlderThanTheStoredOne covers a stale read from a
+// replica: the listing reports a version we are already past, which is not a
+// reason to reload anything.
+func TestSyncIgnoresAVersionOlderThanTheStoredOne(t *testing.T) {
+	source := newTestSource(10)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.SyncInterval = time.Hour    // driven by hand
+		p.Timeouts.RefreshInterval = time.Hour // nothing drains the pending set
+	})
+
+	e, exists := c.entryOf(7)
+	if !exists {
+		t.Fatalf("item 7 is missing")
+	}
+
+	// pretend we already hold something newer than anything the source lists
+	e.version.Store(1 << 40)
+
+	// the reconciliation only queues reloads, it does not perform them, so the
+	// pending set is what says whether it decided to reload anything
+	c.sync(c.ctx, c.newLoader())
+
+	got := c.pending.size()
+	if got != 0 {
+		t.Fatalf("a reconciliation over an up-to-date replica queued %d reloads", got)
+	}
+}
+
+// TestInvalidationDoesNotCauseASecondReloadAtTheNextSync is why LoadMultipleFunc
+// reports the version of the content it returns. If it did not, the stored
+// version would stay behind and every invalidated item would be loaded twice -
+// once by the invalidation and once by the next reconciliation.
+func TestInvalidationDoesNotCauseASecondReloadAtTheNextSync(t *testing.T) {
+	source := newTestSource(10)
+	watcher := newSyncWatcher()
+
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.Timeouts.SyncInterval = time.Hour // driven by hand
+		p.Timeouts.RefreshInterval = 5 * time.Millisecond
+		p.afterSync = watcher.hook()
+	})
+
+	source.set(7, "changed")
+	c.Invalidate(7)
+
+	ok := waitFor(5*time.Second, func() bool { return name(c, 7) == "changed" })
+	if !ok {
+		t.Fatalf("the invalidation was never applied")
+	}
+
+	before := source.loadMultipleCalls.Load()
+
+	c.sync(c.ctx, c.newLoader())
+	time.Sleep(50 * time.Millisecond)
+
+	got := source.loadMultipleCalls.Load()
+	if got != before {
+		t.Fatalf("the reconciliation reloaded an item the invalidation had just loaded (%d loads)", got-before)
 	}
 }

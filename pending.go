@@ -2,9 +2,10 @@ package eventual
 
 import "sync"
 
-// pendingIDs is the set of IDs waiting to be loaded. Invalidate, an expired TTL
-// and a Get for an unknown ID all only put an ID in here; the background
-// goroutine then drains the whole set and loads it in batches.
+// pendingIDs is the set of IDs waiting to be loaded. Invalidate, a reconciliation
+// that found a newer version and a Get for an unknown ID all only put an ID in
+// here; the background goroutine then drains the whole set and loads it in
+// batches.
 //
 // The set deduplicates on its own. The flag on the entry is a shortcut in front
 // of it, which saves taking this mutex for repeated marks of the same ID.

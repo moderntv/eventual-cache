@@ -49,9 +49,8 @@ func benchmarkOrder(n int) []int32 {
 }
 
 // BenchmarkGetThroughput answers "how many reads per second". It runs the cache
-// in a realistic configuration - metrics registered and a TTL set, so the read
-// path pays for the shard counter and the coarse clock check - and reads 200 000
-// items in random order.
+// in a realistic configuration - metrics registered, so the read path pays for
+// the shard counter - and reads 200 000 items in random order.
 //
 // RunParallel spawns GOMAXPROCS goroutines, so the scaling curve comes from
 // -cpu=1,2,4,...
@@ -63,7 +62,6 @@ func BenchmarkGetThroughput(b *testing.B) {
 		p.Shards = 256
 		p.Timeouts.SyncInterval = time.Hour
 		p.Timeouts.RefreshInterval = time.Hour
-		p.Timeouts.TTL = time.Hour // set, but nothing expires during the run
 	}))
 	if err != nil {
 		b.Fatal(err)
@@ -107,7 +105,6 @@ func BenchmarkGetThroughputHot(b *testing.B) {
 		p.Shards = 256
 		p.Timeouts.SyncInterval = time.Hour
 		p.Timeouts.RefreshInterval = time.Hour
-		p.Timeouts.TTL = time.Hour
 	}))
 	if err != nil {
 		b.Fatal(err)
@@ -196,40 +193,6 @@ func BenchmarkGetParallelWithMetrics(b *testing.B) {
 	})
 }
 
-// BenchmarkGetParallelWithTTL adds the coarse clock check to the read path.
-func BenchmarkGetParallelWithTTL(b *testing.B) {
-	source := newTestSource(200_000)
-
-	c, err := New(testParams(source, func(p *Params[testItem]) {
-		p.Shards = 256
-		p.Timeouts.SyncInterval = time.Hour
-		p.Timeouts.RefreshInterval = time.Hour
-		p.Timeouts.TTL = time.Hour
-	}))
-	if err != nil {
-		b.Fatal(err)
-	}
-
-	b.Cleanup(c.Close)
-
-	IDs := testIDs(200_000)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-
-		var value *testItem
-		for pb.Next() {
-			value = c.Get(IDs[i%len(IDs)])
-			i++
-		}
-
-		benchSink = value
-	})
-}
-
 // BenchmarkGetParallelOneShard shows what a badly distributing shard hash costs -
 // every lookup lands in the same shard.
 func BenchmarkGetParallelOneShard(b *testing.B) {
@@ -263,6 +226,29 @@ func BenchmarkGetMiss(b *testing.B) {
 	}
 
 	benchSink = value
+}
+
+// BenchmarkGetMissParallel is the shape a flood of lookups for IDs that do not
+// exist has. It is the one read path a caller can point at the cache on purpose,
+// so it has to scale with the cores like a hit does - which is what the shared
+// read in the rate limiter is for.
+func BenchmarkGetMissParallel(b *testing.B) {
+	c, _ := benchmarkCache(b, 200_000, 256, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		ID := 10_000_000 + atomicOffset.Add(1<<20)
+
+		var value *testItem
+		for pb.Next() {
+			ID++
+			value = c.Get(ID)
+		}
+
+		benchSink = value
+	})
 }
 
 func BenchmarkInvalidateDeduplicated(b *testing.B) {

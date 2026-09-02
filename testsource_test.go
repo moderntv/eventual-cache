@@ -2,6 +2,7 @@ package eventual
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -14,12 +15,16 @@ import (
 type testItem struct {
 	ID   int64
 	Name string
+	// Version grows with every set, the way an updated_at column would.
+	Version int64
 }
 
 // testSource is a fake data source with call counters and hooks.
 type testSource struct {
 	mu    sync.Mutex
 	items map[int64]testItem
+	// version is the source's monotonic clock, bumped by every set.
+	version int64
 	// omit holds IDs that listIDs pretends not to see, even though the source
 	// still has them (a stale read from a replica).
 	omit map[int64]struct{}
@@ -30,9 +35,28 @@ type testSource struct {
 	listIDsErr atomic.Pointer[error]
 	loadErr    atomic.Pointer[error]
 
-	loadDelay atomic.Int64 // nanoseconds
+	// failFirst makes the next N loadMultiple calls fail, whatever loadErr says.
+	failFirst atomic.Int64
 
-	onLoad atomic.Pointer[func(IDs []int64)]
+	// failFast holds IDs whose batch fails without waiting out the loadDelay.
+	failFast sync.Map
+	// failFastWaitFor makes such a batch wait until this many loads are in
+	// flight before it fails, so that a test about the loads in flight is not a
+	// race against the workers starting them.
+	failFastWaitFor atomic.Int64
+	// ctxCancelled counts loadMultiple calls interrupted by their context.
+	ctxCancelled atomic.Int64
+
+	// inFlight/maxInFlight record how many loadMultiple calls overlap.
+	inFlight    atomic.Int64
+	maxInFlight atomic.Int64
+
+	// maxBatch is the largest batch the loader ever asked for. It lives here
+	// rather than in a closure in each test, because loadMultiple is called from
+	// several workers at once.
+	maxBatch atomic.Int64
+
+	loadDelay atomic.Int64 // nanoseconds
 
 	requestsMu sync.Mutex
 	requests   map[int64]int
@@ -67,7 +91,8 @@ func (s *testSource) set(ID int64, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.items[ID] = testItem{ID: ID, Name: name}
+	s.version++
+	s.items[ID] = testItem{ID: ID, Name: name, Version: s.version}
 }
 
 func (s *testSource) remove(ID int64) {
@@ -75,6 +100,43 @@ func (s *testSource) remove(ID int64) {
 	defer s.mu.Unlock()
 
 	delete(s.items, ID)
+}
+
+// recordMax raises target to value when value is the new maximum.
+func recordMax(target *atomic.Int64, value int64) {
+	for {
+		peak := target.Load()
+		if value <= peak || target.CompareAndSwap(peak, value) {
+			return
+		}
+	}
+}
+
+// awaitInFlight blocks until at least want loads are running, or gives up.
+func (s *testSource) awaitInFlight(want int64) {
+	if want <= 0 {
+		return
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.inFlight.Load() >= want {
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (s *testSource) hasFailFastID(IDs []int64) bool {
+	for _, ID := range IDs {
+		_, found := s.failFast.Load(ID)
+		if found {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *testSource) count() int {
@@ -138,7 +200,7 @@ func setErr(p *atomic.Pointer[error], err error) {
 	p.Store(&err)
 }
 
-func (s *testSource) listIDs(_ context.Context) (IDs []int64, err error) {
+func (s *testSource) listIDs(_ context.Context) (items []SourceItem, err error) {
 	s.listIDsCalls.Add(1)
 
 	err = s.err(&s.listIDsErr)
@@ -149,33 +211,53 @@ func (s *testSource) listIDs(_ context.Context) (IDs []int64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	IDs = make([]int64, 0, len(s.items))
-	for ID := range s.items {
+	items = make([]SourceItem, 0, len(s.items))
+	for ID, item := range s.items {
 		_, omitted := s.omit[ID]
 		if omitted {
 			continue
 		}
 
-		IDs = append(IDs, ID)
+		items = append(items, SourceItem{ID: ID, Version: item.Version})
 	}
-	sort.Slice(IDs, func(i, j int) bool { return IDs[i] < IDs[j] })
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 
-	return IDs, nil
+	return items, nil
 }
 
-func (s *testSource) loadMultiple(_ context.Context, IDs []int64) (entries []LoadedEntry[testItem], err error) {
+func (s *testSource) loadMultiple(ctx context.Context, IDs []int64) (entries []LoadedEntry[testItem], err error) {
 	s.loadMultipleCalls.Add(1)
 	s.recordRequests(IDs...)
 
-	hook := s.onLoad.Load()
-	if hook != nil {
-		(*hook)(IDs)
+	running := s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
+
+	recordMax(&s.maxInFlight, running)
+	recordMax(&s.maxBatch, int64(len(IDs)))
+
+	// a batch holding one of these fails without waiting out the delay
+	if s.hasFailFastID(IDs) {
+		s.awaitInFlight(s.failFastWaitFor.Load())
+
+		return nil, errors.New("this batch always fails")
 	}
 
 	d := s.loadDelay.Load()
 	if d > 0 {
-		time.Sleep(time.Duration(d))
+		select {
+		case <-time.After(time.Duration(d)):
+		case <-ctx.Done():
+			s.ctxCancelled.Add(1)
+
+			return nil, ctx.Err()
+		}
 	}
+
+	remaining := s.failFirst.Add(-1)
+	if remaining >= 0 {
+		return nil, errors.New("transient source failure")
+	}
+	s.failFirst.Store(0)
 
 	err = s.err(&s.loadErr)
 	if err != nil {
@@ -193,7 +275,7 @@ func (s *testSource) loadMultiple(_ context.Context, IDs []int64) (entries []Loa
 		}
 
 		value := item
-		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value})
+		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value, Version: item.Version})
 	}
 
 	return entries, nil
@@ -214,6 +296,9 @@ func testParams(source *testSource, modify func(p *Params[testItem])) Params[tes
 		LoadMultipleFunc: source.loadMultiple,
 		Timeouts:         testTimeouts,
 		Shards:           16,
+		// the retry count is the production one, only the wait between attempts
+		// is compressed so that the failure tests do not sleep for seconds
+		loadRetryBackoff: time.Millisecond,
 	}
 
 	if modify != nil {

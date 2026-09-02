@@ -14,10 +14,10 @@ type entry[T any] struct {
 	// an item either is in the replica with a value, or it is not there at all.
 	value atomic.Pointer[T]
 
-	// refreshAt is when the item should be reloaded, in milliseconds of the
-	// coarse clock. Zero means never. It is not an expiration: Get keeps
-	// returning the value, it only marks the item for a reload on the way out.
-	refreshAt atomic.Int64
+	// version is the version of the value above, as reported by the loader. The
+	// reconciliation compares it against the version the source lists and marks
+	// the item for a reload when the source is ahead.
+	version atomic.Int64
 
 	// invalidated is set when the item is waiting for a reload. It is cleared
 	// just before the reload starts, so an invalidation arriving during the load
@@ -33,9 +33,9 @@ type entry[T any] struct {
 	markedForDeletion atomic.Bool
 }
 
-func newEntry[T any](value *T, refreshAt int64) (e *entry[T]) {
+func newEntry[T any](value *T, version int64) (e *entry[T]) {
 	e = &entry[T]{}
-	e.refreshAt.Store(refreshAt)
+	e.version.Store(version)
 	// the value is stored last, so a reader which already sees it also sees the
 	// metadata that belongs to it
 	e.value.Store(value)
