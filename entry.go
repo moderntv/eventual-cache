@@ -19,6 +19,18 @@ type entry[T any] struct {
 	// the item for a reload when the source is ahead.
 	version atomic.Int64
 
+	// refreshAt is the unix nanosecond deadline after which the item is marked
+	// for a reload by the reconciliation, even though nothing said it changed. It
+	// is the backstop for an invalidation that never arrived, used instead of
+	// version when the source cannot report versions.
+	//
+	// It is a deadline and not the time of the load, so that the jitter is drawn
+	// once when the value is stored and a sweep is one comparison.
+	//
+	// Zero means the item never expires, which is what Timeouts.MaxAge 0 leaves
+	// it at.
+	refreshAt atomic.Int64
+
 	// invalidated is set when the item is waiting for a reload. It is cleared
 	// just before the reload starts, so an invalidation arriving during the load
 	// marks the item again instead of being swallowed.
@@ -33,9 +45,10 @@ type entry[T any] struct {
 	markedForDeletion atomic.Bool
 }
 
-func newEntry[T any](value *T, version int64) (e *entry[T]) {
+func newEntry[T any](value *T, version, refreshAt int64) (e *entry[T]) {
 	e = &entry[T]{}
 	e.version.Store(version)
+	e.refreshAt.Store(refreshAt)
 	// the value is stored last, so a reader which already sees it also sees the
 	// metadata that belongs to it
 	e.value.Store(value)

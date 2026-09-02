@@ -5,14 +5,27 @@ import (
 	"time"
 )
 
+// sweepCounts is what one sweep decided. It is a struct and not a handful of
+// return values because they are all ints and all mean something different.
+type sweepCounts struct {
+	marked   int
+	removed  int
+	outdated int
+	// expired counts items marked for a reload because of their age, as opposed
+	// to outdated, which counts those the source reported with a newer version.
+	expired int
+	// ageDeferred counts items past MaxAge that MaxRefreshPerSync left for the
+	// next run.
+	ageDeferred int
+}
+
 // syncStats describes one reconciliation run.
 type syncStats struct {
-	Total    int
-	Added    int
-	Marked   int
-	Removed  int
-	Outdated int
-	Duration time.Duration
+	sweepCounts
+
+	total    int
+	added    int
+	duration time.Duration
 }
 
 // sync reconciles the replica with the source: items the source no longer has
@@ -51,26 +64,26 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 		c.available[item.ID] = item.Version
 	}
 
-	marked, removed, outdated := c.sweep()
+	counts := c.sweep()
 	added := c.fill(ctx, l, items)
 
 	stats := syncStats{
-		Total:    len(items),
-		Added:    added,
-		Marked:   marked,
-		Removed:  removed,
-		Outdated: outdated,
-		Duration: time.Since(start),
+		sweepCounts: counts,
+		total:       len(items),
+		added:       added,
+		duration:    time.Since(start),
 	}
 
 	c.log.Info().
-		Int("total", stats.Total).
-		Int("added", stats.Added).
-		Int("marked", stats.Marked).
-		Int("removed", stats.Removed).
-		Int("outdated", stats.Outdated).
+		Int("total", stats.total).
+		Int("added", stats.added).
+		Int("marked", stats.marked).
+		Int("removed", stats.removed).
+		Int("outdated", stats.outdated).
+		Int("expired", stats.expired).
+		Int("age_deferred", stats.ageDeferred).
 		Int64("items", c.itemsCount.Load()).
-		Float64("duration_s", stats.Duration.Seconds()).
+		Float64("duration_s", stats.duration.Seconds()).
 		Msg("reconciliation finished")
 
 	c.finishSync(stats)
@@ -88,11 +101,25 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 // An item the source reports with a version newer than the stored one is marked
 // for a reload, which is how a lost invalidation is eventually noticed. The
 // reload itself goes through the same machinery as Invalidate.
-func (c *Cache[T]) sweep() (marked, removed, outdated int) {
+//
+// An item that has outlived Timeouts.MaxAge is marked for a reload too. That is
+// the same safety net for a source which cannot report versions, and unlike the
+// other two it is hygiene rather than correctness, so MaxRefreshPerSync may put
+// some of it off until the next run.
+func (c *Cache[T]) sweep() (counts sweepCounts) {
+	// read once for the whole run: on a large replica a clock read per item would
+	// cost more than the rest of the sweep
+	now := time.Now().UnixNano()
+	capped := c.ageBudgetPerShard > 0
+
 	c.forEachShardParallel(func(index int, sh *shard[T]) {
 		toDelete := c.shardDelete[index][:0]
 		toReload := c.shardReload[index][:0]
-		localMarked := 0
+		local := sweepCounts{}
+
+		// the budget is per shard and lives in the worker, so the sweep stays
+		// free of any shared counter the parallel workers would fight over
+		budget := c.ageBudgetPerShard
 
 		sh.mu.RLock()
 		for ID, e := range sh.data {
@@ -106,14 +133,38 @@ func (c *Cache[T]) sweep() (marked, removed, outdated int) {
 
 				if version > e.version.Load() {
 					toReload = append(toReload, ID)
+					local.outdated++
+
+					continue
 				}
+
+				// the backstop for a lost invalidation when the source has no
+				// versions to compare. The item is only queued for a reload, never
+				// dropped - Get keeps answering with the old value until the reload
+				// lands.
+				refreshAt := e.refreshAt.Load()
+				if refreshAt == 0 || now <= refreshAt {
+					continue
+				}
+
+				// out of budget: the item stays expired and the next run takes it,
+				// which is what makes the cap a delay and not a loss
+				if capped && budget == 0 {
+					local.ageDeferred++
+
+					continue
+				}
+
+				toReload = append(toReload, ID)
+				budget--
+				local.expired++
 
 				continue
 			}
 
 			wasMarked := !e.markedForDeletion.CompareAndSwap(false, true)
 			if !wasMarked {
-				localMarked++
+				local.marked++
 
 				continue
 			}
@@ -122,7 +173,7 @@ func (c *Cache[T]) sweep() (marked, removed, outdated int) {
 		}
 		sh.mu.RUnlock()
 
-		localRemoved := c.removeMarked(sh, toDelete)
+		local.removed = c.removeMarked(sh, toDelete)
 
 		// marking takes the pending mutex, so it happens outside the shard lock
 		for _, ID := range toReload {
@@ -136,18 +187,35 @@ func (c *Cache[T]) sweep() (marked, removed, outdated int) {
 
 		c.shardDelete[index] = toDelete
 		c.shardReload[index] = toReload
-		c.shardCounts[index].marked = localMarked
-		c.shardCounts[index].removed = localRemoved
-		c.shardCounts[index].outdated = len(toReload)
+		c.shardCounts[index].sweepCounts = local
 	})
 
 	for i := range c.shardCounts {
-		marked += c.shardCounts[i].marked
-		removed += c.shardCounts[i].removed
-		outdated += c.shardCounts[i].outdated
+		counts.marked += c.shardCounts[i].marked
+		counts.removed += c.shardCounts[i].removed
+		counts.outdated += c.shardCounts[i].outdated
+		counts.expired += c.shardCounts[i].expired
+		counts.ageDeferred += c.shardCounts[i].ageDeferred
 	}
 
 	return
+}
+
+// ageBudgetPerShard splits MaxRefreshPerSync between the shards, which is what
+// lets a sweep enforce the cap without a counter the parallel workers share. The
+// price is that the cap holds only roughly, and for a hygienic operation that is
+// a good trade.
+//
+// It rounds up: a cap smaller than the shard count would otherwise leave every
+// shard with a budget of zero and switch MaxAge off without saying so.
+//
+// 0 means no cap.
+func ageBudgetPerShard(maxRefreshPerSync, shards int) int {
+	if maxRefreshPerSync <= 0 {
+		return 0
+	}
+
+	return (maxRefreshPerSync + shards - 1) / shards
 }
 
 // removeMarked deletes the given IDs from the shard, skipping any that were
@@ -243,10 +311,12 @@ func (c *Cache[T]) finishSync(stats syncStats) {
 		return
 	}
 
-	c.metrics.SyncAddedCount.Add(float64(stats.Added))
-	c.metrics.SyncMarkedCount.Add(float64(stats.Marked))
-	c.metrics.SyncRemovedCount.Add(float64(stats.Removed))
-	c.metrics.SyncOutdatedCount.Add(float64(stats.Outdated))
-	c.metrics.LastSyncDuration.Set(stats.Duration.Seconds())
+	c.metrics.SyncAddedCount.Add(float64(stats.added))
+	c.metrics.SyncMarkedCount.Add(float64(stats.marked))
+	c.metrics.SyncRemovedCount.Add(float64(stats.removed))
+	c.metrics.SyncOutdatedCount.Add(float64(stats.outdated))
+	c.metrics.SyncExpiredCount.Add(float64(stats.expired))
+	c.metrics.SyncAgeDeferredCount.Add(float64(stats.ageDeferred))
+	c.metrics.LastSyncDuration.Set(stats.duration.Seconds())
 	c.metrics.LastSyncTimestamp.Set(float64(time.Now().Unix()))
 }

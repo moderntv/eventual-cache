@@ -5,7 +5,7 @@ import "testing"
 func TestEntryHoldsTheValueAndItsFlags(t *testing.T) {
 	first := &testItem{ID: 1, Name: "first"}
 
-	e := newEntry(first, 1234)
+	e := newEntry(first, 1234, 5678)
 
 	if e.value.Load() != first {
 		t.Fatalf("newEntry did not store the value")
@@ -13,6 +13,10 @@ func TestEntryHoldsTheValueAndItsFlags(t *testing.T) {
 
 	if e.version.Load() != 1234 {
 		t.Fatalf("newEntry did not store the version")
+	}
+
+	if e.refreshAt.Load() != 5678 {
+		t.Fatalf("newEntry did not store the refresh deadline")
 	}
 
 	if e.invalidated.Load() {

@@ -34,6 +34,9 @@ type Metrics struct {
 	SyncMarkedCount   prometheus.Counter
 	SyncRemovedCount  prometheus.Counter
 	SyncOutdatedCount prometheus.Counter
+
+	SyncExpiredCount     prometheus.Counter
+	SyncAgeDeferredCount prometheus.Counter
 }
 
 func New(
@@ -89,6 +92,15 @@ func New(
 		{
 			&m.SyncOutdatedCount, "sync_outdated",
 			"Items reloaded by reconciliation because the source reported a newer version",
+		},
+		{
+			&m.SyncExpiredCount, "sync_expired",
+			"Items reloaded by reconciliation because they reached MaxAge",
+		},
+		{
+			&m.SyncAgeDeferredCount, "sync_age_deferred",
+			"Items past MaxAge left for the next run by MaxRefreshPerSync; " +
+				"permanently non-zero means the cap is too low for MaxAge to hold",
 		},
 	}
 

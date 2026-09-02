@@ -3,6 +3,7 @@ package eventual
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 
 	metrics_pkg "github.com/moderntv/eventual-cache/internal/metrics"
+	"github.com/moderntv/eventual-cache/internal/utils"
 )
 
 // Cache is an eventually consistent in-memory replica of a whole dataset keyed
@@ -38,6 +40,10 @@ type Cache[T any] struct {
 	shards    []shard[T]
 	shardHash ShardHashFunc
 	shardBits uint
+
+	// ageBudgetPerShard is MaxRefreshPerSync split between the shards, 0 for no
+	// cap. See ageBudgetPerShard().
+	ageBudgetPerShard int
 
 	missLimiter *rateLimiter
 
@@ -103,6 +109,8 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 		shards:    make([]shard[T], params.Shards),
 		shardHash: params.ShardHash,
 		shardBits: shardBits(params.Shards),
+
+		ageBudgetPerShard: ageBudgetPerShard(params.MaxRefreshPerSync, params.Shards),
 
 		missLimiter: newRateLimiter(params.MissRateLimit),
 
@@ -274,10 +282,12 @@ func (c *Cache[T]) store(ID int64, value *T, version int64) (added bool) {
 
 	sh := c.shardOf(ID)
 
+	refreshAt := c.nextRefreshAt(true)
+
 	sh.mu.Lock()
 	e, exists = sh.data[ID]
 	if !exists {
-		sh.data[ID] = newEntry(value, version)
+		sh.data[ID] = newEntry(value, version, refreshAt)
 	}
 	sh.mu.Unlock()
 
@@ -297,6 +307,10 @@ func (c *Cache[T]) store(ID int64, value *T, version int64) (added bool) {
 func (c *Cache[T]) updateEntry(e *entry[T], value *T, version int64) {
 	e.version.Store(version)
 
+	// any successful load restarts the age clock, whatever triggered it, so the
+	// age really is the time since the last load
+	e.refreshAt.Store(c.nextRefreshAt(false))
+
 	// a successful load is proof the source has the item
 	if e.markedForDeletion.Load() {
 		e.markedForDeletion.Store(false)
@@ -305,6 +319,31 @@ func (c *Cache[T]) updateEntry(e *entry[T], value *T, version int64) {
 	// the value is stored last, so a reader which already sees it also sees the
 	// metadata that belongs to it
 	e.value.Store(value)
+}
+
+// nextRefreshAt returns the deadline for an item that has just been loaded, or 0
+// when MaxAge is off.
+//
+// The first store of an item draws uniformly from the whole period, every later
+// reload takes a full MaxAge. That difference is not cosmetic: the warm-up stores
+// the whole dataset within seconds, so with one rule for both the entire replica
+// would fall due in the same window and reload at once. The uniform first draw
+// phases the replica, and once phased it stays phased.
+func (c *Cache[T]) nextRefreshAt(first bool) int64 {
+	maxAge := int64(c.timeouts.MaxAge)
+	if maxAge <= 0 {
+		return 0
+	}
+
+	now := time.Now().UnixNano()
+
+	// Int63n gives [0, maxAge), so this is (0, maxAge] - never the current
+	// instant, which would expire the item the moment it is stored
+	if first {
+		return now + 1 + rand.Int63n(maxAge)
+	}
+
+	return now + int64(utils.RandomizeDuration(c.timeouts.MaxAge, c.timeouts.Randomizer))
 }
 
 // remove drops the item from the replica. Only a load which proves the source

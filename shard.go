@@ -38,11 +38,9 @@ var _ = [1]struct{}{}[unsafe.Sizeof(shard[struct{}]{})%cacheLinePadBytes]
 // syncShardCounts is where a parallel shard worker leaves its counts. Padded,
 // because the workers write to neighbouring elements of one slice.
 type syncShardCounts struct {
-	marked   int
-	removed  int
-	outdated int
+	sweepCounts
 
-	_ [cacheLinePadBytes - 24]byte
+	_ [cacheLinePadBytes - unsafe.Sizeof(sweepCounts{})]byte
 }
 
 // compile time check that the counts are a whole cache line pair

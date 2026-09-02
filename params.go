@@ -110,6 +110,24 @@ type Params[T any] struct {
 	// Default 4, 1 loads batches one after another.
 	LoadConcurrency int
 
+	// MaxRefreshPerSync caps how many items may be marked for a reload because of
+	// their age in one reconciliation. It does not apply to reloads caused by a
+	// newer version or to deletions - those are correctness and must not be
+	// delayed.
+	//
+	// The budget is split evenly between the shards, rounded up, so a run may
+	// mark a little more than this. To make Timeouts.MaxAge a real bound rather
+	// than a wish, the cap has to get through the whole dataset within one MaxAge:
+	//
+	//	MaxRefreshPerSync >= items * SyncInterval / MaxAge
+	//
+	// Below that the items keep ageing past the limit, which is what the
+	// sync_age_deferred metric shows: permanently non-zero means the cap is too
+	// low.
+	//
+	// Default 0, which means no cap.
+	MaxRefreshPerSync int `mapstructure:"max_refresh_per_sync"`
+
 	// MissRateLimit caps how many IDs unknown to the replica may be queued for a
 	// load per second by Get, so that lookups for random IDs cannot overload the
 	// source. Invalidations and the reconciliation are never rate limited.
@@ -155,6 +173,10 @@ func (p *Params[T]) check() error {
 
 	if p.LoadConcurrency < 0 {
 		return errors.New("loadConcurrency cannot be negative")
+	}
+
+	if p.MaxRefreshPerSync < 0 {
+		return errors.New("maxRefreshPerSync cannot be negative")
 	}
 
 	return p.Timeouts.check()

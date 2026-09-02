@@ -29,6 +29,11 @@ type testSource struct {
 	// still has them (a stale read from a replica).
 	omit map[int64]struct{}
 
+	// versionsHidden makes the source report Version 0 everywhere, the way a
+	// source without an updated_at column has to. Change detection is then off
+	// and only MaxAge can notice a lost invalidation.
+	versionsHidden atomic.Bool
+
 	listIDsCalls      atomic.Int64
 	loadMultipleCalls atomic.Int64
 
@@ -139,6 +144,21 @@ func (s *testSource) hasFailFastID(IDs []int64) bool {
 	return false
 }
 
+// hideVersions switches the source's change detection off, which is the mode
+// MaxAge exists for.
+func (s *testSource) hideVersions() {
+	s.versionsHidden.Store(true)
+}
+
+// reportedVersion is the version the source admits to for an item.
+func (s *testSource) reportedVersion(version int64) int64 {
+	if s.versionsHidden.Load() {
+		return 0
+	}
+
+	return version
+}
+
 func (s *testSource) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,7 +238,7 @@ func (s *testSource) listIDs(_ context.Context) (items []SourceItem, err error) 
 			continue
 		}
 
-		items = append(items, SourceItem{ID: ID, Version: item.Version})
+		items = append(items, SourceItem{ID: ID, Version: s.reportedVersion(item.Version)})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 
@@ -275,7 +295,9 @@ func (s *testSource) loadMultiple(ctx context.Context, IDs []int64) (entries []L
 		}
 
 		value := item
-		entries = append(entries, LoadedEntry[testItem]{ID: ID, Value: &value, Version: item.Version})
+		entries = append(entries, LoadedEntry[testItem]{
+			ID: ID, Value: &value, Version: s.reportedVersion(item.Version),
+		})
 	}
 
 	return entries, nil

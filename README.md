@@ -115,11 +115,97 @@ from being done twice: without it the stored version would stay behind, and the
 next reconciliation would reload everything the invalidations had just loaded.
 
 Leaving `Version` at 0 everywhere switches change detection off — items are then
-only reloaded by an explicit `Invalidate`.
+only reloaded by an explicit `Invalidate`, and `MaxAge` takes over as the safety
+net. See the next section.
 
 An item is never dropped because it is old, only because the source stopped
 having it. There is no TTL and no expiration: a stale value is always better than
 no value here, because the caller asked a cache, not the database.
+
+## `MaxAge` — when the source cannot report versions
+
+Not every source has a version to report. A payload assembled from a dozen tables
+has no single `updated_at` to select, and a version invented by the service that
+loads the item is worse than none at all: behind a load balancer the instance
+that answers `ListIDsFunc` and the instance that answered `LoadMultipleFunc` are
+different processes with different values, so every reconciliation would find
+every item outdated and reload the whole replica, in a loop, forever.
+
+For that case leave `Version` at 0 everywhere and set `Timeouts.MaxAge` instead.
+An item that has not been loaded for that long is marked for a reload by the next
+reconciliation, whether or not anything said it changed.
+
+```go
+Timeouts: eventual.Timeouts{
+	SyncInterval: 15 * time.Minute,
+	MaxAge:       6 * time.Hour,
+	Randomizer:   0.1,
+},
+MaxRefreshPerSync: 42000,
+```
+
+With versions off, this is how each kind of change reaches the replica:
+
+| Change | How it propagates | Within |
+|---|---|---|
+| the source gains an item | new in the ID set → loaded | 1× `SyncInterval` |
+| the source loses an item | gone from the ID set → removed | 2× `SyncInterval` |
+| the content of an item changes | `Invalidate` from the message bus | `RefreshInterval` |
+| **the invalidation was lost** | **`MaxAge`** | `MaxAge` + `SyncInterval` |
+
+Note that the first two rows need no versions at all — they are decided by
+membership in the ID set, which the reconciliation diffs either way.
+
+**The bound is `MaxAge` + `SyncInterval`, not `MaxAge`.** The age is only checked
+during a reconciliation; walking every item on every `RefreshInterval` tick is not
+affordable on a large replica. For the same reason a `MaxAge` shorter than
+`SyncInterval` is rejected by `New` — it could never be honoured.
+
+**Nothing is ever dropped because of its age.** An expired item is only *marked
+for a reload*, and `Get` keeps returning the old value until the reload lands.
+This is not a detail: `Get` → `nil` means "the source does not have this", so a
+hole in a warm replica is a wrong answer, not a slow one. That is also why this is
+not called a TTL.
+
+### The cost, and how to cap it
+
+A full replica reloading itself every `MaxAge` is real traffic: a million items
+with `MaxAge` 1 h is ~278 loads/s **per instance**, all aimed at the source. With
+6 h it is ~46/s. Measure before choosing.
+
+Two things keep it from arriving all at once:
+
+-   **The deadline of an item is drawn when it is stored.** The *first* store
+    draws uniformly from `(0, MaxAge]`, every later reload takes a full `MaxAge`
+    ± `Randomizer`. Without that first uniform draw the warm-up cohort — the whole
+    dataset, stored within seconds — would fall due in the same window and reload
+    together. After one period the replica has phased itself and stays phased.
+-   **`MaxRefreshPerSync`** caps how many items one reconciliation may mark
+    *because of their age*. It does not apply to reloads caused by a newer version
+    or to deletions: those are correctness and must not be delayed. When the cap
+    bites, the rest is taken by the next run — the degradation is "recovery takes
+    longer", not "the source fell over".
+
+The cap has to be able to get through the whole dataset within one `MaxAge`,
+otherwise `MaxAge` is a wish rather than a bound:
+
+```
+MaxRefreshPerSync >= items * SyncInterval / MaxAge
+```
+
+A million items with `SyncInterval` 15 min and `MaxAge` 6 h needs
+`1e6 * 15/360 ≈ 42 000` per run. Below that the items keep ageing past the limit,
+which is exactly what `sync_age_deferred` shows: permanently non-zero means the
+cap is too low.
+
+The budget is split evenly between the shards (rounded up, so a cap smaller than
+the shard count still does something), which is what lets the parallel sweep
+enforce it without a counter the workers share. The cap therefore holds only
+roughly — fine for a hygienic operation.
+
+`MaxAge` is off by default: the deadline stays 0, the sweep skips the check on
+the first comparison, and nothing ever expires. The 8 B per item it needs are
+part of every entry either way — see [Sizing](#sizing-a-large-replica).
 
 ## What the source has to provide
 
@@ -269,6 +355,10 @@ roughly twice as slow). `Params.ShardHash` takes any function with the
     starts a goroutine.
 -   **MissRateLimit** — how many IDs unknown to the replica `Get` may queue per
     second. Default 100; a negative value means no limit.
+-   **MaxRefreshPerSync** — cap on how many items one reconciliation may mark for
+    a reload *because of their age*. Never applies to version reloads or
+    deletions. Must be at least `items * SyncInterval / MaxAge` to make `MaxAge`
+    a real bound. Default 0 = no cap.
 -   **Shards** — power of two, default 256.
 -   **ShardHash** — default `MultiplyShiftHash`.
 -   **Timeouts** — see below.
@@ -279,6 +369,11 @@ roughly twice as slow). `Params.ShardHash` takes any function with the
     bound on how long a lost invalidation can go unnoticed. Randomized by
     `Randomizer`. Required, must be > 0.
 -   **RefreshInterval** — how often marked items are reloaded. Default 1s.
+-   **MaxAge** — how long an item may go without a reload before a reconciliation
+    marks it for one. The backstop for a lost invalidation when the source cannot
+    report versions; leave it off when it can. Checked only during a
+    reconciliation, so the real bound is `MaxAge + SyncInterval` and a `MaxAge`
+    below `SyncInterval` is rejected. Default 0 = off.
 -   **Randomizer** — `[0, 1]`. 0 = no jitter, 0.1 = ±10 %. Without it every
     instance of the service would hit the source in the same second.
 
@@ -303,6 +398,8 @@ label `name`):
 | `list_ids_errors` | Counter | `ListIDsFunc` calls that failed |
 | `sync_runs` | Counter | Reconciliation runs |
 | `sync_added` / `sync_marked` / `sync_removed` / `sync_outdated` | Counter | What the reconciliations did |
+| `sync_expired` | Counter | Items marked for a reload because they reached `MaxAge` |
+| `sync_age_deferred` | Counter | Items past `MaxAge` left for the next run by `MaxRefreshPerSync` |
 
 `reads_count` and `misses_count` are counted **per shard** and collected into
 Prometheus once a second by the background goroutine. Incrementing a Prometheus
@@ -312,8 +409,10 @@ event happens.
 
 Worth alerting on: `time() - last_sync_timestamp` above a few sync intervals,
 `list_ids_errors` growing, `misses_rate_limited` growing, a `pending_count` that
-does not come back down, and a `sync_outdated` in the order of the whole dataset
-(which means the two `Version`s are not on the same scale).
+does not come back down, a `sync_outdated` in the order of the whole dataset
+(which means the two `Version`s are not on the same scale), and a
+`sync_age_deferred` that is never zero (which means `MaxRefreshPerSync` is too low
+for `MaxAge` to hold).
 
 ---
 
@@ -425,14 +524,18 @@ Measured on an i5-11500H with **1 000 000 items**, 1024 shards:
 
 | | |
 |---|---|
-| The replica itself | 59 MB, i.e. **62 B per item** on top of your values |
+| The replica itself | 70 MB, i.e. **70 B per item** on top of your values |
 | Reconciliation buffers | 46 MB, allocated on the first run and kept |
 | One reconciliation | ~170 ms of CPU, spread over `GOMAXPROCS` |
 
 The buffers are reused between runs on purpose, so that a reconciliation does not
 allocate proportionally to the dataset — the 46 MB never comes back. Budget
-around **105 MB of overhead per million items** plus the values themselves, and
+around **116 MB of overhead per million items** plus the values themselves, and
 set `GOMEMLIMIT`: a million entries is a million pointers for the GC to mark.
+
+The per item figure includes the 8 B of `refreshAt` whether or not `MaxAge` is
+set — the field is part of every entry, which pushes it from the 24 B size class
+into the 32 B one.
 
 `ListIDsFunc` returns the whole ID list on every run, so `SyncInterval` is also
 how often the source is asked for all of it. Ten to fifteen minutes is a
