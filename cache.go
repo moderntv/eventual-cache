@@ -140,7 +140,7 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 	c.wg.Add(1)
 	go c.run()
 
-	c.log.Info().
+	c.log.Debug().
 		Int64("items", c.itemsCount.Load()).
 		Int("shards", len(c.shards)).
 		Msg("cache started")
@@ -392,7 +392,7 @@ func (c *Cache[T]) warmUp(ctx context.Context) (err error) {
 		return fmt.Errorf("initial load failed: %w", err)
 	}
 
-	c.log.Info().
+	c.log.Debug().
 		Int("total", len(IDs)).
 		Int("loaded", added).
 		Float64("duration_s", time.Since(start).Seconds()).
