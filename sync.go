@@ -74,7 +74,7 @@ func (c *Cache[T]) sync(ctx context.Context, l *loader[T]) {
 		duration:    time.Since(start),
 	}
 
-	c.log.Info().
+	c.log.Debug().
 		Int("total", stats.total).
 		Int("added", stats.added).
 		Int("marked", stats.marked).
