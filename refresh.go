@@ -96,7 +96,7 @@ func (c *Cache[T]) reloadMarked(l *loader[T]) {
 		return
 	}
 
-	c.log.Debug().
+	c.log.Trace().
 		Int("count", len(l.IDs)).
 		Int("added", added).
 		Int("removed", removed).
