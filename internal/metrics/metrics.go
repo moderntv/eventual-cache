@@ -14,6 +14,7 @@ const (
 type Metrics struct {
 	ItemsCount        prometheus.Gauge
 	PendingCount      prometheus.Gauge
+	DelayedCount      prometheus.Gauge
 	LastSyncTimestamp prometheus.Gauge
 	LastSyncDuration  prometheus.Gauge
 
@@ -52,6 +53,7 @@ func New(
 	}{
 		{&m.ItemsCount, "items_count", "Current number of cached items"},
 		{&m.PendingCount, "pending_count", "Number of IDs waiting to be loaded"},
+		{&m.DelayedCount, "delayed_count", "Invalidated IDs waiting for InvalidateDelay"},
 		{&m.LastSyncTimestamp, "last_sync_timestamp", "Unix timestamp of the last successful reconciliation"},
 		{&m.LastSyncDuration, "last_sync_duration_seconds", "Duration of the last reconciliation in seconds"},
 	}

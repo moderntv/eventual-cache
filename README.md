@@ -237,7 +237,7 @@ Timeouts: eventual.Timeouts{
 -   Another invalidation of the same ID during the wait starts it again, so the
     load always comes at least `InvalidateDelay` after the *last* invalidation.
     An item invalidated more often than that is only loaded once the
-    invalidations stop.
+    invalidations stop. A `delayed_count` that never goes down is the sign of it.
 -   The wait does not care whether the item is already marked. An item that is
     pending when the invalidation arrives gets one more load after the delay —
     the pending one may be exactly the load that comes too early.
@@ -434,6 +434,7 @@ label `name`):
 |--------|------|-------------|
 | `items_count` | Gauge | Items in the replica |
 | `pending_count` | Gauge | IDs waiting to be loaded |
+| `delayed_count` | Gauge | Invalidated IDs waiting for `InvalidateDelay` |
 | `last_sync_timestamp` | Gauge | Unix time of the last successful reconciliation |
 | `last_sync_duration_seconds` | Gauge | Duration of the last reconciliation |
 | `reads_count` | Counter | `Get` calls |
@@ -457,7 +458,9 @@ event happens.
 
 Worth alerting on: `time() - last_sync_timestamp` above a few sync intervals,
 `list_ids_errors` growing, `misses_rate_limited` growing, a `pending_count` that
-does not come back down, a `sync_outdated` in the order of the whole dataset
+does not come back down, a `delayed_count` that does not come back down (items
+invalidated faster than `InvalidateDelay`, which are never loaded), a
+`sync_outdated` in the order of the whole dataset
 (which means the two `Version`s are not on the same scale), and a
 `sync_age_deferred` that is never zero (which means `MaxRefreshPerSync` is too low
 for `MaxAge` to hold).

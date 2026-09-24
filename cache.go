@@ -444,4 +444,5 @@ func (c *Cache[T]) collectMetrics(mc *metricsCollector) {
 
 	c.metrics.ItemsCount.Set(float64(c.itemsCount.Load()))
 	c.metrics.PendingCount.Set(float64(c.pending.size()))
+	c.metrics.DelayedCount.Set(float64(c.delayed.size()))
 }

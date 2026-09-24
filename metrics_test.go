@@ -96,6 +96,36 @@ func TestLoadAndInvalidationMetricsAreCountedAtTheEvent(t *testing.T) {
 	}
 }
 
+func TestDelayedInvalidationsAreCounted(t *testing.T) {
+	source := newTestSource(5)
+	c := newTestCache(t, source, func(p *Params[testItem]) {
+		p.MetricsRegistry = test_utils.MetricsRegistry()
+		p.Timeouts.InvalidateDelay = time.Hour
+		p.Timeouts.RefreshInterval = time.Hour
+	})
+
+	c.Invalidate(1)
+	c.Invalidate(7)
+	c.Invalidate(7)
+
+	c.collectMetrics(&metricsCollector{})
+
+	got := testutil.ToFloat64(c.metrics.DelayedCount)
+	if got != 2 {
+		t.Fatalf("expected 2 delayed IDs, got %v", got)
+	}
+
+	got = testutil.ToFloat64(c.metrics.PendingCount)
+	if got != 0 {
+		t.Fatalf("a delayed invalidation reached the pending set, got %v", got)
+	}
+
+	got = testutil.ToFloat64(c.metrics.InvalidationsCount)
+	if got != 3 {
+		t.Fatalf("expected 3 invalidations, got %v", got)
+	}
+}
+
 func TestRateLimitedMissesAreCounted(t *testing.T) {
 	source := newTestSource(5)
 	c := newTestCache(t, source, func(p *Params[testItem]) {
