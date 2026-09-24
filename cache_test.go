@@ -93,6 +93,7 @@ func TestNewValidatesParams(t *testing.T) {
 		{"no sync interval", func(p *Params[testItem]) { p.Timeouts.SyncInterval = 0 }},
 		{"randomizer above one", func(p *Params[testItem]) { p.Timeouts.Randomizer = 1.5 }},
 		{"negative max age", func(p *Params[testItem]) { p.Timeouts.MaxAge = -time.Second }},
+		{"negative invalidate delay", func(p *Params[testItem]) { p.Timeouts.InvalidateDelay = -time.Second }},
 		{"negative max refresh per sync", func(p *Params[testItem]) { p.MaxRefreshPerSync = -1 }},
 		// the age check only runs in a reconciliation, so a MaxAge shorter than
 		// SyncInterval cannot be honoured and is a configuration mistake

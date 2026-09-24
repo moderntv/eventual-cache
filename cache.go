@@ -50,6 +50,7 @@ type Cache[T any] struct {
 	// dynamic attributes
 	pending   *pendingIDs
 	batchFull chan struct{}
+	delayed   *delayedIDs
 
 	itemsCount atomic.Int64
 
@@ -62,6 +63,10 @@ type Cache[T any] struct {
 	shardMissing [][]int64
 	shardCounts  []syncShardCounts
 	syncMissing  []int64
+
+	// dueIDs is the buffer promoteDue drains the delayed set into. Only the
+	// background goroutine touches it, so it needs no lock.
+	dueIDs []int64
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -116,6 +121,7 @@ func New[T any](params Params[T]) (c *Cache[T], err error) {
 
 		pending:   newPendingIDs(),
 		batchFull: make(chan struct{}, 1),
+		delayed:   newDelayedIDs(),
 
 		available:    make(map[int64]int64),
 		shardIDs:     make([][]int64, params.Shards),
@@ -178,7 +184,8 @@ func (c *Cache[T]) Get(ID int64) *T {
 
 // Invalidate marks the item for a reload. It does not load anything itself: the
 // background goroutine reloads all marked items together, either on its next
-// tick or as soon as there are enough of them for a whole batch.
+// tick or as soon as there are enough of them for a whole batch. With
+// Timeouts.InvalidateDelay the item is only marked once the delay has passed.
 //
 // The caller is expected to call it when the source announces a change (typically
 // from a NATS handler) - the cache itself does not subscribe to anything.
@@ -187,6 +194,19 @@ func (c *Cache[T]) Invalidate(ID int64) {
 		c.metrics.InvalidationsCount.Inc()
 	}
 
+	if c.timeouts.InvalidateDelay > 0 {
+		c.delayed.add(ID, time.Now().Add(c.timeouts.InvalidateDelay).UnixNano())
+
+		return
+	}
+
+	c.markForReload(ID)
+}
+
+// markForReload marks an item for the next reload run, whether the replica has
+// it or not. It is what Invalidate does right away, or promoteDue after the
+// delay.
+func (c *Cache[T]) markForReload(ID int64) {
 	e, exists := c.entryOf(ID)
 	if exists {
 		c.markEntry(ID, e)

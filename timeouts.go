@@ -41,6 +41,25 @@ type Timeouts struct {
 	// Default 0, which switches the age check off.
 	MaxAge time.Duration `mapstructure:"max_age"`
 
+	// InvalidateDelay is how long Invalidate waits before it marks the item for a
+	// reload. It is for a source that learns about the change from the same
+	// message as the cache - typically another service with a cache of its own,
+	// subscribed to the same subject. Without the delay the reload can reach the
+	// source before it has processed the message, and the old value it answers
+	// with stays until a reconciliation notices.
+	//
+	// Another invalidation of the same item during the wait starts it again, so
+	// the load always comes at least InvalidateDelay after the last one. The
+	// reload runs on the next refresh tick, so the item is loaded within
+	// InvalidateDelay + RefreshInterval.
+	//
+	// Only Invalidate is delayed; items marked by a reconciliation or by a Get for
+	// an unknown ID are loaded right away. The delay is not randomized - it is a
+	// lower bound, and jitter would only shorten it.
+	//
+	// Default 0, which marks the item right away.
+	InvalidateDelay time.Duration `mapstructure:"invalidate_delay"`
+
 	// Randomizer specifies how much the durations should be randomized. Value 0
 	// means no randomization, 0.1 means 10 %, etc. Any value above 1 is rejected.
 	// e.g. the real sync interval is `SyncInterval` +/- `SyncInterval` *
@@ -69,6 +88,10 @@ func (t *Timeouts) check() error {
 
 	if t.MaxAge < 0 {
 		return errors.New("maxAge cannot be negative")
+	}
+
+	if t.InvalidateDelay < 0 {
+		return errors.New("invalidateDelay cannot be negative")
 	}
 
 	// the age check only runs in a reconciliation - walking every item on every

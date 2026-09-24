@@ -10,9 +10,10 @@ import (
 // Prometheus.
 const metricsInterval = time.Second
 
-// run is the only background goroutine of the cache. It reloads marked items,
-// periodically reconciles the replica with the source and collects the shard
-// counters into Prometheus.
+// run is the only background goroutine of the cache. It moves delayed
+// invalidations to the pending set once their delay has passed, reloads marked
+// items, periodically reconciles the replica with the source and collects the
+// shard counters into Prometheus.
 //
 // Reloading and reconciliation share one goroutine on purpose: a reconciliation
 // can then never interleave with a reload, which is one less race to reason
@@ -46,6 +47,7 @@ func (c *Cache[T]) run() {
 			return
 
 		case <-refreshTicker.C:
+			c.promoteDue()
 			c.reloadMarked(l)
 
 		case <-c.batchFull:
@@ -101,6 +103,19 @@ func (c *Cache[T]) reloadMarked(l *loader[T]) {
 		Int("added", added).
 		Int("removed", removed).
 		Msg("marked items reloaded")
+}
+
+// promoteDue marks the delayed invalidations whose InvalidateDelay has passed,
+// so that the reloadMarked right after it loads them.
+//
+// Nothing is being loaded while it runs - loads and this share one goroutine -
+// so an item that is already marked is loaded by that very run, which is after
+// its delay too.
+func (c *Cache[T]) promoteDue() {
+	c.dueIDs = c.delayed.drainDue(c.dueIDs[:0], time.Now().UnixNano())
+	for _, ID := range c.dueIDs {
+		c.markForReload(ID)
+	}
 }
 
 // remark puts an ID back into the pending set after a failed load. It does not

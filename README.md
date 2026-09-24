@@ -21,6 +21,7 @@ The value type `T` is generic, the key is always `int64`.
     replica does not have it. Never blocks on I/O.
 -   **`Invalidate(ID)`** — marks the item for a reload. It does not load
     anything; the background goroutine reloads all marked items together.
+    With `Timeouts.InvalidateDelay` it waits that long before it marks anything.
 -   **`Close()`** — stops the background goroutine and waits for it.
 
 That is the whole surface. There is deliberately no `GetMultiple`, no `ForEach`,
@@ -48,6 +49,9 @@ only once all batches are stored, or with an error.
 
 Marking is cheap and never touches the source: a flag on the item plus the ID in
 a set. Repeated marks of the same ID between two runs collapse into one load.
+
+`Invalidate` can be told to wait before it marks anything, see
+[`InvalidateDelay`](#invalidatedelay--when-the-source-hears-the-same-message).
 
 **3. Batched reloading.** Every `RefreshInterval` (1 s by default) the goroutine
 drains the whole set and loads it through `LoadMultipleFunc` in batches of
@@ -150,7 +154,7 @@ With versions off, this is how each kind of change reaches the replica:
 |---|---|---|
 | the source gains an item | new in the ID set → loaded | 1× `SyncInterval` |
 | the source loses an item | gone from the ID set → removed | 2× `SyncInterval` |
-| the content of an item changes | `Invalidate` from the message bus | `RefreshInterval` |
+| the content of an item changes | `Invalidate` from the message bus | `InvalidateDelay` + `RefreshInterval` |
 | **the invalidation was lost** | **`MaxAge`** | `MaxAge` + `SyncInterval` |
 
 Note that the first two rows need no versions at all — they are decided by
@@ -206,6 +210,47 @@ roughly — fine for a hygienic operation.
 `MaxAge` is off by default: the deadline stays 0, the sweep skips the check on
 the first comparison, and nothing ever expires. The 8 B per item it needs are
 part of every entry either way — see [Sizing](#sizing-a-large-replica).
+
+## `InvalidateDelay` — when the source hears the same message
+
+Sometimes the source is itself a cache: another service keeps its own copy of
+the data and subscribes to the same invalidation subject as this cache. Both get
+the message at the same moment and nothing orders them. When this cache reloads
+before the source has processed the message, it stores the old value, and
+nothing will invalidate it again — the change waits for a reconciliation to
+notice it, which without versions means `MaxAge`.
+
+`InvalidateDelay` makes `Invalidate` wait before it marks the item:
+
+```go
+Timeouts: eventual.Timeouts{
+	SyncInterval:    15 * time.Minute,
+	MaxAge:          6 * time.Hour,
+	InvalidateDelay: 2 * time.Second,
+	Randomizer:      0.1,
+},
+```
+
+-   An invalidated ID waits in a set of its own until the delay has passed; the
+    next refresh tick then marks it like any other invalidation. The item is
+    loaded within `InvalidateDelay` + `RefreshInterval`.
+-   Another invalidation of the same ID during the wait starts it again, so the
+    load always comes at least `InvalidateDelay` after the *last* invalidation.
+    An item invalidated more often than that is only loaded once the
+    invalidations stop.
+-   The wait does not care whether the item is already marked. An item that is
+    pending when the invalidation arrives gets one more load after the delay —
+    the pending one may be exactly the load that comes too early.
+-   Only `Invalidate` is delayed. A reconciliation has just asked the source,
+    and a `Get` for an unknown ID answers no message, so both load right away.
+-   The delay is not randomized: it is a lower bound, and jitter would only
+    shorten it.
+-   The wait does not wake the goroutine early the way a full batch does. A
+    burst of invalidations is loaded in one run once its delay has passed.
+
+It only helps when the source does process the message, just later. A source
+that lost the message altogether keeps answering with the old value, and only
+versions or `MaxAge` get past that.
 
 ## What the source has to provide
 
@@ -374,6 +419,9 @@ roughly twice as slow). `Params.ShardHash` takes any function with the
     report versions; leave it off when it can. Checked only during a
     reconciliation, so the real bound is `MaxAge + SyncInterval` and a `MaxAge`
     below `SyncInterval` is rejected. Default 0 = off.
+-   **InvalidateDelay** — how long `Invalidate` waits before it marks the item,
+    restarted by every further invalidation of it. For a source that hears the
+    same message as the cache. Not randomized. Default 0 = mark right away.
 -   **Randomizer** — `[0, 1]`. 0 = no jitter, 0.1 = ±10 %. Without it every
     instance of the service would hit the source in the same second.
 
